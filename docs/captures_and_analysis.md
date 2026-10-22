@@ -4,66 +4,40 @@ Este documento registra as capturas efetuadas em bancada utilizando o ESP32 / Bu
 
 ---
 
-## 1. Cenário 1: Central em Standby (Repouso)
+## 1. Cenário Comparativo Perfeito: 41°C Chama Apagada vs. 41°C Chama Acesa
 
-### Captura em Modo Bridge UART a 2800 baud:
+Mantendo a temperatura **rigorosamente fixa em 41°C**, isolamos exclusivamente a variável **CHAMA**:
+
+### A. 41°C com Chama Apagada (56 bytes exatos):
 ```text
-QUUUUUEQUEDTTUEUEEQUUUEU\x0cEQUEDQUDEDQ5EUUUUTUUTQD\x0c
+Hex:   55 55 55 55 55 45 54 55 45 44 51 15 14 00 45 15 45 51 45 45 54 55 55 14 15 
+       44 45 14 15 51 14 55 11 45 44 51 55 44 45 44 15 51 35 15 55 55 55 55 54 55 
+       55 54 51 44 14 0C
+
+ASCII: UUUUUETUEDQ\x15\x14\x00E\x15EQEETUU\x14\x15DE\x14\x15Q\x14U\x11EDQUDED\x15Q5\x15UUUUTUUTQD\x14\x0c
 ```
 
-### Representação Hexadecimal:
-```hex
-51 55 55 55 55 55 45 51 55 45 44 54 54 55 45 55 45 45 51 55 55 55 45 55 0C 
-45 51 55 45 44 51 55 44 45 44 51 35 45 55 55 55 55 54 55 55 54 51 44 0C
-```
+### B. 41°C com Chuveiro Ligado / Chama Acesa (56 bytes exatos):
+```text
+Hex:   5D 55 55 55 55 5D 77 77 77 77 77 77 77 5D 57 55 57 57 01 55 01 55 55 5D 77 
+       77 77 77 77 77 77 5D 57 55 75 55 55 5D 55 55 55 55 5D 77 77 77 77 77 77 77 
+       5D 57 55 55 77 77
 
-### Análise:
-* O caractere predominante é `U` (`0x55 = 01010101_b`), demonstrando uma linha alternada em pulsos curtos e simétricos.
-* A ausência de flags de alta duração no início do pacote indica que o queimador está desligado.
-* `Byte 2 [4]` está em `0` (Chama desligada).
+ASCII: ]UUUU]wwwwwww]WUWW\x01U\x01UU]wwwwwww]WUuUU]UUUU]wwwwwww]WUUww
+```
 
 ---
 
-## 2. Cenário 2: Chuveiro Ligado com Temperatura em 42°C
+## 2. A Descoberta da Inversão de Polaridade dos Pulsos
 
-### Captura em Modo Bridge UART a 2800 baud:
-```text
-Q\x15UUEUU\x15TU\x15DQ\x15E\x00\x00U\x14DQ\x15Q\x15Q\x15D\x15DTTEED\x00\x15Q\x14U\x11EDQUDED\x15Q5\x00E\x15UU\x11\x11\x15TE\x14TU\x14DUQ\x03\x00
-```
+A análise dos histogramas de largura de pulso entre os dois estados revela:
 
-### Representação Hexadecimal:
-```hex
-51 15 55 55 45 55 55 15 54 55 15 44 51 15 45 00 00 55 14 44 51 15 51 15 51 
-15 44 15 44 54 54 45 45 44 00 15 51 14 55 11 45 44 51 55 44 45 44 15 51 35 
-00 45 15 55 55 11 11 15 54 45 14 54 55 14 44 55 51 03 00
-```
+| Estado | Duração dos Níveis ALTO (HIGH) | Duração dos Níveis BAIXO (LOW) |
+| :--- | :--- | :--- |
+| **Chama Apagada (41°C)** | Predominância estrita de **$360\,\mu\text{s}$** ($1\times$) | Pulsos longos de **$1070\,\mu\text{s}$** ($3\times$ base) ocorrem 55 vezes |
+| **Chama Acesa (41°C)** | Pulsos longos de **$1070\,\mu\text{s}$** ocorrem **60 vezes**! | Predominância estrita de **$360\,\mu\text{s}$** ($1\times$) |
 
-### Análise Comparativa do Byte `0x15`:
-Imediatamente ao abrir o chuveiro, surge o byte **`0x15`**:
-$$\mathbf{0x15} = \mathbf{0001 \ 0101}_b$$
-
-1. **Nibble Alto (`0x1`):**
-   * Corresponde a `Bit 4 = 1` $\rightarrow$ **Chama Ativa / Em Uso**.
-2. **Nibble Baixo (`0x5`):**
-   * Corresponde ao **Código 5** da tabela de temperatura:
-   $$\text{Temperatura} = 37 + 5 = \mathbf{42^\circ\text{C}}$$
-   * Confirmação direta com o valor ajustado fisicamente no visor do aquecedor.
-
----
-
-## 3. Análise de Transições e Temporizações (`sniff 5`)
-
-O comando `sniff 5` capturou as larguras de pulso dos símbolos:
-```text
-Pin 5: HIGH -> LOW  | delta=368us   <-- Bit base (1x tempo)
-Pin 5: LOW  -> HIGH | delta=370us
-Pin 5: HIGH -> LOW  | delta=368us
-Pin 5: LOW  -> HIGH | delta=1108us  <-- Pulso alargado (3x tempo = 3 * 369.3us)
-Pin 5: HIGH -> LOW  | delta=1104us
-Pin 5: LOW  -> HIGH | delta=369us
-Pin 5: LOW  -> HIGH | delta=1847us  <-- Pulso longo (5x tempo)
-...
-Pin 5: HIGH -> LOW  | delta=7199us  <-- Silêncio de fim de quadro (Inter-frame gap)
-```
-
-Essa medição confirma que a base de tempo do oscilador da central é de **$370\,\mu\text{s}$**, justificando a captura a **2700-2800 baud** na UART e determinando os tempos ideais para o firmware receptor no ESP32.
+### O que isso significa:
+1. **Comportamento da Linha em Repouso:** Os símbolos utilizam pulsos alargados em nível BAIXO (active-low pulse width).
+2. **Comportamento em Combustão:** Quando a válvula de gás abre e a ionização confirma a chama, a modulação inverte a polaridade ativa para nível ALTO (active-high pulse width), gerando os blocos de caracteres `0x77` (`'w' = 0111 0111_b`).
+3. O enquadramento tem exatamente o mesmo tamanho temporal (**56 bytes na UART = ~199.9 ms**), comprovando que a cadência do ciclo da central é rigorosamente constante.
