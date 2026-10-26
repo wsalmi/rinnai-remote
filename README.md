@@ -1,349 +1,83 @@
-# Engenharia Reversa do Barramento Digital Rinnai & Controle Remoto ESP32
-
-Este repositório documenta a engenharia reversa completa da camada física, temporização de sinais, codificação e estrutura de protocolo da comunicação entre a central eletrônica de aquecedores a gás **Rinnai** e seus painéis digitais (painel frontal integrado e controles remotos cabeados das linhas REU).
-
-O projeto inclui documentação técnica aprofundada, ferramentas de análise em Python e firmware em C++ (PlatformIO / Arduino) pronto para implementação em microcontroladores ESP32.
-
----
-
-## Sumário
-
-1. [Visão Geral e Arquitetura do Repositório](#1-visão-geral-e-arquitetura-do-repositório)
-2. [Camada Física e Interface Elétrica](#2-camada-física-e-interface-elétrica)
-   - [Pinout do Chicote](#pinout-do-chicote)
-   - [Condicionamento de Sinal (5V TTL vs. 3.3V CMOS)](#condicionamento-de-sinal-5v-ttl-vs-33v-cmos)
-3. [Temporização de Sinais e Modulação de Pulso](#3-temporização-de-sinais-e-modulação-de-pulso)
-   - [Por que NÃO é UART (8N1)? O Fenômeno dos 'U's (0x55)](#por-que-não-é-uart-8n1-o-fenômeno-dos-us-0x55)
-   - [Modulação por Largura de Pulso (PWM / Pulse-Length)](#modulação-por-largura-de-pulso-pwm--pulse-length)
-   - [Medições Reais de Hardware (Deltas de Pulso)](#medições-reais-de-hardware-deltas-de-pulso)
-4. [Camada de Enlace e Formatação dos Quadros](#4-camada-de-enlace-e-formatação-dos-quadros)
-   - [Estrutura do Pacote](#estrutura-do-pacote)
-   - [Ordem dos Bits (LSB-First)](#ordem-dos-bits-lsb-first)
-   - [Mecanismo de Paridade Ímpar (Odd Parity)](#mecanismo-de-paridade-ímpar-odd-parity)
-   - [Mecanismo de Checksum XOR (LRC)](#mecanismo-de-checksum-xor-lrc)
-5. [Mapeamento Completo de Bits do Payload](#5-mapeamento-completo-de-bits-do-payload)
-   - [Pacote Central $\rightarrow$ Painel (Telemetria)](#pacote-central--painel-telemetria)
-   - [Tabela Oficial de Conversão de Temperatura](#tabela-oficial-de-conversão-de-temperatura)
-   - [Pacote Painel $\rightarrow$ Central (Injeção de Comandos)](#pacote-painel--central-injeção-de-comandos)
-6. [Estudo de Caso Real: A Descoberta do Byte 0x15](#6-estudo-de-caso-real-a-descoberta-do-byte-0x15)
-7. [Guia de Replicação para Especialistas](#7-guia-de-replicação-para-especialistas)
-   - [Captura com Bus Pirate / Analisador Lógico](#captura-com-bus-pirate--analisador-lógico)
-   - [Decodificação por Interrupção no ESP32](#decodificação-por-interrupção-no-esp32)
-   - [Transmissão e Injeção de Comandos no TX](#transmissão-e-injeção-de-comandos-no-tx)
-8. [Uso das Ferramentas Python](#8-uso-das-ferramentas-python)
-9. [Compilação e Gravação do Firmware ESP32](#9-compilação-e-gravação-do-firmware-esp32)
-
----
-
-## 1. Visão Geral e Arquitetura do Repositório
-
-```text
-rinnai-remote/
-├── README.md                      # Esta especificação técnica completa
-├── docs/                          # Documentação detalhada complementar
-│   ├── physical_layer.md          # Níveis elétricos, divisores de tensão e osciladores
-│   ├── protocol_spec.md           # Detalhes de quadros, paridade e comandos do painel
-│   └── captures_and_analysis.md   # Logs reais brutos (Standby vs Chuveiro a 42°C)
-├── tools/                         # Utilitários de captura e decodificação
-│   ├── bp_capture.py              # Sniffer em tempo real via WebSocket do Bus Pirate
-│   └── decoder.py                 # Biblioteca Python de validação, paridade e desempacotamento
-└── firmware/                      # Código C++ para ESP32 (PlatformIO)
-    ├── platformio.ini             # Configuração do ambiente esp32dev
-    ├── include/
-    │   ├── rinnai_decoder.h       # Decodificador não-bloqueante por interrupção GPIO
-    │   └── rinnai_encoder.h       # Gerador de pulsos para injeção de botões (+, -, power)
-    └── src/
-        └── main.cpp               # Aplicação principal (Monitor Serial + comandos)
-```
-
----
-
-## 2. Camada Física e Interface Elétrica
-
-### Pinout do Chicote
-A central se comunica com o painel frontal digital através de um chicote com conector de 4 vias:
-
-| Pino | Cor Típica | Sinal | Sentido | Nível Elétrico | Função |
-| :---: | :---: | :---: | :---: | :---: | :--- |
-| **1** | Vermelho | `+5V` | Central $\rightarrow$ Painel | $+5.0\,\text{V}$ DC | Alimentação positiva do painel frontal |
-| **2** | Preto | `GND` | Bidirecional | $0\,\text{V}$ | Referência de terra comum |
-| **3** | Amarelo / Branco | `TX` (Central) | Central $\rightarrow$ Painel | 5V TTL | Telemetria de status, temperatura e chama |
-| **4** | Azul / Verde | `RX` (Central) | Painel $\rightarrow$ Central | 5V TTL | Envio de comandos dos botões físicos |
-
-### Condicionamento de Sinal (5V TTL vs. 3.3V CMOS)
-
-> [!CAUTION]
-> Os pinos GPIO do ESP32 toleram no máximo **3.6V**. A linha de dados da central opera em **5V TTL**. Ligar a linha TX da central diretamente a um pino do ESP32 danificará o microcontrolador a médio/longo prazo.
-
-Recomenda-se um divisor de tensão resistivo simples para a linha de recepção:
-
-```text
-Linha TX Central (5V) ─────[ 10 kΩ ]─────┬─────> GPIO 5 (RX ESP32 - 3.3V)
-                                         │
-                                      [ 20 kΩ ]
-                                         │
-                                        GND
-```
-$$V_{\text{out}} = 5\,\text{V} \times \frac{20\,\text{k}\Omega}{10\,\text{k}\Omega + 20\,\text{k}\Omega} \approx 3.33\,\text{V}$$
-
-Para a linha de transmissão do ESP32 para a central (**GPIO 15 $\rightarrow$ RX Central**), o nível ALTO de 3.3V do ESP32 é superior ao limiar mínimo de nível alto ($V_{IH} = 2.0\,\text{V}$) da lógica TTL da central Rinnai, podendo ser conectado diretamente ou através de um resistor de proteção de $1\,\text{k}\Omega$.
-
----
-
-## 3. Temporização de Sinais e Modulação de Pulso
-
-### Por que NÃO é UART (8N1)? O Fenômeno dos 'U's (0x55)
-Ao conectar um receptor UART convencional a **2800 baud** na linha de dados, obtém-se uma sequência repetitiva de caracteres:
-```text
-D\x0cQUUUUUEQUEDTTUEUEEQUUUEU\x0cEQUEDQUDEDQ5EUUUUTUUTQD...
-```
-
-Analisando a representação binária desses bytes:
-* **`'U'` = `0x55` = `01010101`** (alternância perfeita de 0 e 1)
-* **`'E'` = `0x45` = `01000101`**
-* **`'Q'` = `0x51` = `01010001`**
-* **`'T'` = `0x54` = `01010100`**
-
-Isso ocorre devido ao **aliasing temporal** de amostragem:
-1. A UART a 2800 baud possui período de bit $T_{\text{UART}} = \frac{1}{2800} \approx 357.1\,\mu\text{s}$.
-2. O sinal da Rinnai possui um período de símbolo base de $\approx 370\,\mu\text{s}$.
-3. O receptor UART interpreta cada descida de pulso como um *Start Bit*, realiza a leitura a cada $\approx 357\,\mu\text{s}$, capturando as subidas e descidas alternadas do PWM como se fossem bits `01010101` (`0x55` = `'U'`).
-
-### Modulação por Largura de Pulso (PWM / Pulse-Length)
-O protocolo da Rinnai codifica a informação binária através da **relação de tempo em nível ALTO / BAIXO**:
-
-```text
-               Período de Símbolo: ~600 µs a ~740 µs
-               
-Bit 0:        ┌──────┐
-(Curto ~25%)  │150 µs│                  450 µs
-       ───────┘      └────────────────────────────────────────
-       
-Bit 1:        ┌────────────────────────────┐
-(Longo ~75%)  │           450 µs           │      150 µs
-       ───────┘                            └──────────────────
-       
-Reset / Sync: ┌──────────────────────────────────────────────┐ (> 900 µs)
-(Pausa)       │                                              │
-       ───────┘                                              └───
-```
-
-### Medições Reais de Hardware (Deltas de Pulso)
-Medições obtidas via analisador digital de transição de bordas (`sniff` de hardware no pino 5):
-* **$\Delta t \approx 368\,\mu\text{s} \dots 370\,\mu\text{s}$**: Duração elementar de 1 bit base ($1\times$).
-* **$\Delta t \approx 1108\,\mu\text{s}$**: Duração de 3 tempos base ($3 \times 369.3\,\mu\text{s}$).
-* **$\Delta t \approx 1847\,\mu\text{s}$**: Duração de 5 tempos base ($5 \times 369.4\,\mu\text{s}$).
-* **$\Delta t \approx 7200\,\mu\text{s}$**: Silêncio em repouso entre pacotes (*Inter-frame gap*).
-
-Base de tempo fundamental do oscilador da central:
-$$f_{\text{base}} = \frac{1}{370 \times 10^{-6}\,\text{s}} \approx \mathbf{2702\text{ bps}}$$
-
----
-
-## 4. Camada de Enlace e Formatação dos Quadros
-
-### Estrutura do Pacote
-Cada quadro é constituído por:
-* **1 Pulso de Sincronismo / Reset inicial:** Duração superior a $900\,\mu\text{s}$.
-* **48 Símbolos de Dados:** 48 pulsos modulados = **6 Bytes exatos**.
-* **Intervalo de Repouso:** 7 a 20 ms de linha ociosa antes do próximo ciclo.
-* **Taxa de Repetição:** O pacote completo é retransmitido a cada **150 ms a 200 ms**.
-
-### Ordem dos Bits (LSB-First)
-A transmissão de cada byte ocorre sempre iniciando pelo bit menos significativo:
-$$\text{Ordem no Barramento: } b_0 \rightarrow b_1 \rightarrow b_2 \rightarrow b_3 \rightarrow b_4 \rightarrow b_5 \rightarrow b_6 \rightarrow b_7 \ (\text{MSB})$$
-
-### Mecanismo de Paridade Ímpar (Odd Parity)
-Cada um dos 6 bytes utiliza o **Bit 7 (MSB)** como bit de paridade ímpar:
-
-$$\text{Bit 7} = \begin{cases} 
-0, & \text{se } \sum_{i=0}^{6} b_i \text{ for ÍMPAR} \\ 
-1, & \text{se } \sum_{i=0}^{6} b_i \text{ for PAR} 
-\end{cases}$$
-
-Dessa forma, o total de bits `1` presentes no byte (incluindo o bit 7) **é sempre ímpar**:
-$$\left( \sum_{i=0}^{7} b_i \right) \equiv 1 \pmod 2$$
-
-#### Algoritmo de Validação de Paridade em C++:
-```cpp
-bool checkOddParity(uint8_t byteVal) {
-    uint8_t count = 0;
-    for (int i = 0; i < 8; i++) {
-        if ((byteVal >> i) & 1) count++;
-    }
-    return (count % 2) != 0; // Verdadeiro se ímpar
-}
-```
-
-#### Algoritmo de Geração de Paridade para Envio em C++:
-```cpp
-uint8_t addOddParity(uint8_t data7bit) {
-    uint8_t count = 0;
-    for (int i = 0; i < 7; i++) {
-        if ((data7bit >> i) & 1) count++;
-    }
-    // Se a contagem for par, seta o bit 7 em 1 para tornar ímpar
-    if ((count % 2) == 0) {
-        return data7bit | 0x80;
-    }
-    return data7bit & 0x7F;
-}
-```
-
-### Mecanismo de Checksum XOR (LRC)
-A integridade global do pacote é garantida pelo 6º byte ($\text{Byte}[5]$), que consiste na operação XOR acumulada dos 5 primeiros bytes:
-
-$$\text{Byte}[5] = \text{Byte}[0] \oplus \text{Byte}[1] \oplus \text{Byte}[2] \oplus \text{Byte}[3] \oplus \text{Byte}[4]$$
-
-Se a soma calculada for idêntica ao $\text{Byte}[5]$ recebido, o quadro é considerado íntegro e validado para processamento.
-
----
-
-## 5. Mapeamento Completo de Bits do Payload
-
-### Pacote Central $\rightarrow$ Painel (Telemetria)
-
-Formato dos 6 bytes emitidos pela central no pino **TX (Central) / RX (ESP32)**:
-
-```text
-┌──────────────┬──────────────┬──────────────┬──────────────┬──────────────┬──────────────┐
-│    Byte 0    │    Byte 1    │    Byte 2    │    Byte 3    │    Byte 4    │    Byte 5    │
-├──────────────┼──────────────┼──────────────┼──────────────┼──────────────┼──────────────┤
-│  Header/ID   │ Status Sist. │ Chama & Temp │  Potência/Ex │ Diag/Erros   │ Checksum XOR │
-└──────────────┴──────────────┴──────────────┴──────────────┴──────────────┴──────────────┘
-```
-
-#### Detalhamento Campo a Campo:
-
-* **Byte 0 (Cabeçalho e Prioridade):**
-  * `Bits 0..3`: Fixo em `0x7` (indica identificador de origem: Central Principal).
-  * `Bits 4..6`: Prioridade da central no barramento.
-  * `Bit 7`: Paridade ímpar.
-* **Byte 1 (Estado de Energia e Escala):**
-  * `Bit 6 (0x40)`: **Sistema Ligado / Standby** (`1` = Ligado, `0` = Standby/Desligado).
-  * `Bit 3 (0x08)`: **Escala Secundária** (habilitado quando a temperatura é ajustada para 35°C).
-  * `Bit 7`: Paridade ímpar.
-* **Byte 2 (Chama e Ajuste de Temperatura):**
-  * `Bits 0..3`: **Código Linear de Temperatura** (ver tabela a seguir).
-  * `Bit 4 (0x10)`: **Chama Ativa / Queimador em Uso** (`1` = Fogo aceso, fluxo de água detectado).
-  * `Bit 7`: Paridade ímpar.
-* **Byte 3 (Modulação da Válvula de Gás e Exaustor):**
-  * Bits de comando da modulação proporcional de potência (Low, Medium, High).
-  * Feedback do tacômetro do ventilador de exaustão forçada.
-* **Byte 4 (Diagnóstico e Falhas):**
-  * `0x20`: Operação normal sem erros.
-  * Outros valores: Código de erro ativo mostrado no visor (Ex.: erro `11` = falha de acendimento, `12` = perda de chama por falta de gás, `90` = exaustão obstruída).
-* **Byte 5 (Checksum):**
-  * $\text{Byte}[0] \oplus \text{Byte}[1] \oplus \text{Byte}[2] \oplus \text{Byte}[3] \oplus \text{Byte}[4]$.
-
----
-
-### Tabela Oficial de Conversão de Temperatura
-
-A temperatura programada é decodificada a partir dos bits `[3:0]` do Byte 2:
-$$\text{Temperatura (°C)} = 37 + \text{Código}$$
-
-| Código Hex (`Byte 2 [3:0]`) | Flag Byte 1 (`0x08`) | Temperatura Resultante | Comportamento no Visor |
-| :---: | :---: | :---: | :--- |
-| `0x0` | **Ativo (1)** | **35°C** | Modo temperatura mínima de verão |
-| `0x0` | Inativo (0) | **37°C** | Base linear de aquecimento |
-| `0x1` | Inativo (0) | **38°C** | Incremento +1°C |
-| `0x2` | Inativo (0) | **39°C** | Incremento +1°C |
-| `0x3` | Inativo (0) | **40°C** | Incremento +1°C |
-| `0x4` | Inativo (0) | **41°C** | Incremento +1°C |
-| **`0x5`** | Inativo (0) | **42°C** | **Confirmado em laboratório (Byte 2 = `0x15`)** |
-| `0x6` | Inativo (0) | **43°C** | Incremento +1°C |
-| `0x7` | Inativo (0) | **44°C** | Incremento +1°C |
-| `0x8` | Inativo (0) | **45°C** | Incremento +1°C |
-| `0x9` | Inativo (0) | **46°C** | Incremento +1°C |
-| `0xA` | Inativo (0) | **47°C** | Incremento +1°C |
-| `0xB` | Inativo (0) | **48°C** | Incremento +1°C |
-| `0xC` | Inativo (0) | **50°C** | Salto de escala (não há 49°C) |
-| `0xD` | Inativo (0) | **55°C** | Salto de escala |
-| `0xE` | Inativo (0) | **60°C** | Temperatura máxima padrão |
-
----
-
-### Pacote Painel $\rightarrow$ Central (Injeção de Comandos)
-
-Formato transmitido pelo painel frontal ou pelo ESP32 no pino **RX (Central) / TX (ESP32)** para simular o pressionamento dos botões:
-
-| Byte | Campo | Mapeamento de Bits |
-| :---: | :--- | :--- |
-| **0** | **ID do Painel** | `[7:4] = 0x0` (origem: painel frontal). `[3:0]` ID de estação. |
-| **1** | **Botões de Sistema** | `Bit 0 (0x01)`: Botão **Power (Liga/Desliga)** pressionado.<br>`Bit 2 (0x04)`: Botão **Prioridade** pressionado. |
-| **2** | **Botões de Temperatura** | `Bit 0 (0x01)`: Botão **Temperatura + (Up)** pressionado.<br>`Bit 1 (0x02)`: Botão **Temperatura - (Down)** pressionado. |
-| **3** | **Handshake** | Estado do barramento. |
-| **4** | **Constante** | Fixo em `0xBF`. |
-| **5** | **Checksum** | XOR dos Bytes 0 a 4. |
-
----
-
-## 6. Estudo de Caso Real: A Descoberta do Byte 0x15
-
-Durante os testes em bancada, comparamos o tráfego com o aquecedor em repouso e com o chuveiro em funcionamento a 42°C:
-
-### Quadro em Standby (Repouso)
-```hex
-51 55 55 55 55 55 45 51 55 45 44 54 54 55 45 55 45 45 51 55 55 55 45 55 0C ...
-```
-
-### Quadro com Chuveiro Ligado a 42°C
-```hex
-51 15 55 55 45 55 55 15 54 55 15 44 51 15 45 00 00 55 14 44 51 15 51 15 51 ...
-```
-
-### Desmontagem Analítica do Byte `0x15`:
-O byte **`0x15`** surgiu na transmissão com a abertura do fluxo de água:
-
-$$\mathbf{0x15} = \mathbf{0001} \ \mathbf{0101}_b$$
-
-1. **`Bit 4 = 1` (`0x10`):** Flag de **Chama Ativa / Burner In Use**. Acionada quando o sensor de fluxo aciona a ignição e a ionização confirma a chama.
-2. **`Bits 0..3 = 0101_b` (`0x05`):** Código de temperatura:
-   $$\text{Temperatura} = 37 + 5 = \mathbf{42^\circ\text{C}}$$
-3. **`Bit 7 = 0`:** Paridade ímpar: o número de bits 1 em `0001 0101` é exatamente 2 (par), logo o bit 7 assume `0` para que a paridade seja mantida.
-
----
-
-## 7. Guia de Replicação para Especialistas
-
-### Captura com Bus Pirate / Analisador Lógico
-Para verificar o sinal em hardware antes de compilar o firmware:
-1. No terminal do Bus Pirate (Bruce Firmware), selecione o modo **DIO** (`m` $\rightarrow$ `9`).
-2. Execute o analisador lógico com amostragem gráfica na tela do dispositivo:
-   ```text
-   logic 5
-   ```
-3. Ou utilize o rastreador de tempos de transição:
-   ```text
-   sniff 5
-   ```
-   Você deverá observar os deltas característicos de $\sim 368\,\mu\text{s}$ e $\sim 1108\,\mu\text{s}$.
-
-### Decodificação por Interrupção no ESP32
-O arquivo [rinnai_decoder.h](file:///Users/wesleysalmi/source-me/rinnai-remote/firmware/include/rinnai_decoder.h) implementa uma máquina de estados de interrupção não bloqueante (`IRAM_ATTR`):
-
-1. A cada transição (`CHANGE`) no pino RX, a rotina calcula $\Delta t = \text{now} - \text{lastRiseTime}$.
-2. Se $\Delta t > 900\,\mu\text{s}$, a rotina identifica o pulso de **Reset** e sincroniza o índice de bits em zero.
-3. Se a duração estiver entre $450\,\mu\text{s}$ e $800\,\mu\text{s}$, avalia se o tempo em ALTO é superior a $300\,\mu\text{s}$ (Bit 1) ou inferior (Bit 0).
-4. Ao acumular 48 bits, confere o Checksum XOR e disponibiliza o objeto estruturado `RinnaiStatus`.
-
-### Transmissão e Injeção de Comandos no TX
-O arquivo [rinnai_encoder.h](file:///Users/wesleysalmi/source-me/rinnai-remote/firmware/include/rinnai_encoder.h) gera os pulsos com precisão de microssegundos no pino TX (GPIO 15):
-* Reset inicial: $1200\,\mu\text{s}$ em HIGH.
-* Bit 0: $150\,\mu\text{s}$ em HIGH e $450\,\mu\text{s}$ em LOW.
-* Bit 1: $450\,\mu\text{s}$ em HIGH e $150\,\mu\text{s}$ em LOW.
-
----
-
-## 8. Uso das Ferramentas Python
-
-### A. Teste Unitário do Decodificador:
+# Rinnai Remote
+
+Engenharia reversa do barramento digital entre a central eletrônica de aquecedores a gás **Rinnai** e o painel frontal (e controles remotos cabeados da linha REU). O barramento não é UART 8N1: a informação vai em pulsos de largura variável. Este repositório guarda a documentação dessa camada física e do enquadramento, ferramentas em Python para captura e decodificação, e firmware para ESP32 que lê a telemetria e injeta cliques de botão.
+
+A especificação longa está em [`docs/`](docs/). Este arquivo descreve o que o código faz hoje e como executá-lo.
+
+## O que está incluído
+
+- Notas de camada física, quadros e capturas de bancada em `docs/`.
+- Decodificador Python de pacotes de 6 bytes (`tools/decoder.py`), com teste embutido, decodificação de um pacote e monitor contínuo (simulação, pipe ou WebSocket).
+- Scripts que falam com um Bus Pirate no firmware Bruce, em parte dos comentários associado a um M5StickC Plus2, pela serial USB ou por WebSocket.
+- Painel de terminal (`tools/live_dashboard.py`) que amostra a linha como UART a 2800 baud e interpreta quadros de 63 bytes.
+- Coletores interativos que gravam amostras de temperatura e de ligado/desligado em JSON.
+- Firmware PlatformIO para ESP32 (`firmware/`): monitor serial e comandos `+`, `-` e `p`.
+- Sketch Arduino para ESP32-C3 Super Mini (`firmware_c3/`): mesma decodificação, mais interface web na porta 80.
+
+Há dois caminhos de decodificação no repositório, e eles não são o mesmo algoritmo:
+
+| Caminho | Onde | O que interpreta |
+| :--- | :--- | :--- |
+| Pacote de 6 bytes | `firmware/`, `firmware_c3/`, `tools/decoder.py`, `tools/bp_capture.py` | 48 bits após o pulso de sincronismo, paridade ímpar e checksum XOR |
+| Amostra UART de 63 bytes | `tools/live_dashboard.py`, `tools/bp_temp_sniffer.py`, coletores | Fluxo 8N1 a 2800 baud, alinhado pelo preâmbulo `15 45 15 51` |
+
+## Stack
+
+- Python 3, sem `requirements.txt`. Os scripts de serial importam PySerial (`import serial`).
+- PlatformIO, plataforma `espressif32`, placa `esp32dev`, framework Arduino (`firmware/platformio.ini`).
+- Sketch Arduino para ESP32-C3, usando as bibliotecas de placa `WiFi`, `WebServer` e `ESPmDNS` (`firmware_c3/firmware_c3.ino`). Não há `platformio.ini` nesse diretório.
+- Hardware citado no código e nas notas: central Rinnai, Bus Pirate (firmware Bruce) e ESP32 ou ESP32-C3 Super Mini (HW-466AB).
+
+## Requisitos
+
+- Python 3 no `PATH`. O teste do decodificador foi executado com Python 3.12.3.
+- PySerial, apenas para os scripts que abrem a porta serial. Neste ambiente o módulo `serial` não está instalado; `tools/decoder.py` e `tools/bp_capture.py --help` não dependem dele.
+- PlatformIO Core (ou a extensão no editor) para compilar `firmware/`. O comando `pio` não está instalado neste ambiente, então a compilação não foi executada aqui.
+- Placa e core Arduino-ESP32 para gravar `firmware_c3/`.
+- Para as ferramentas de captura: Bus Pirate acessível por serial USB (115200 baud na console) ou por WebSocket na rede. Os coletores e o painel pedem interação no painel físico do aquecedor.
+
+## Configuração
+
+Não há arquivo `.env`. Os nomes abaixo são constantes ou opções de linha de comando. Os valores que já estão no código (rede Wi-Fi, caminho de serial, IP padrão) não são repetidos aqui.
+
+| Nome | Onde | Função |
+| :--- | :--- | :--- |
+| `WIFI_SSID`, `WIFI_PASS` | `firmware_c3/firmware_c3.ino` | Rede Wi-Fi em modo estação. Edite os dois antes de gravar a placa. |
+| `RINNAI_RX_PIN`, `RINNAI_TX_PIN` | `firmware/src/main.cpp` | GPIO 5 (recepção) e GPIO 15 (transmissão) |
+| `RINNAI_RX_PIN`, `RINNAI_TX_PIN`, `LED_PIN` | `firmware_c3/firmware_c3.ino` | GPIO 4 (RX), GPIO 5 (TX) e GPIO 8 (LED da placa, ativo em nível baixo) |
+| `PORT`, `BAUD` | scripts em `tools/` que usam serial | Caminho do Bus Pirate e baud da console (`115200`). O padrão no código é um device macOS `cu.usbserial`; em Linux ajuste para o device local. |
+| `--host`, `--port` | `tools/decoder.py`, `tools/bp_capture.py` | IP e porta HTTP/WebSocket do Bus Pirate. `--port` padrão: 80. |
+| `--port`, `--pin`, `--sniff-duration` | `tools/bp_serial_sniff.py` | Serial, pino (`0`, `25` ou `26`) e duração do `sniff` (padrão 10 s) |
+| `-w` / `--watch` / `--live`, `--demo`, `-i` / `--interval`, `--no-color` | `tools/decoder.py` | Monitor contínuo. `--interval` padrão: 0,2 s. O argumento `--demo` existe no `--help`, mas o programa não consulta esse flag: a simulação é o caminho padrão de `--watch` quando não há `--host` e o stdin é um terminal. |
+
+O sketch C3 anuncia mDNS com o nome `rinnai` (`http://rinnai.local/` quando o resolvedor local funciona). A espera de associação Wi-Fi é de 15 s; se falhar, o servidor HTTP ainda sobe.
+
+Scripts que fixam `PORT` e precisam ser editados para outra máquina:
+
+- `tools/bp_grove_monitor.py`
+- `tools/bp_live_monitor.py`
+- `tools/bp_serial_sniff.py` (o padrão de `--port`)
+- `tools/bp_temp_sniffer.py`
+- `tools/interactive_collector.py`
+- `tools/live_dashboard.py`
+- `tools/power_state_collector.py`
+
+A UART passiva configurada por esses scripts no Bus Pirate usa RX no pino 25, TX dummy no pino 10, 2800 baud, 8N1, e em seguida o comando `bridge`.
+
+## Como executar
+
+Comandos abaixo partem da raiz do repositório. Os de Python do decodificador foram executados aqui. Os demais dependem de hardware ou de ferramentas que não estão instaladas neste ambiente.
+
+### Decodificador (executado)
+
+Teste embutido, sem hardware:
+
 ```bash
-cd tools
-python3 decoder.py
+python3 tools/decoder.py
 ```
-*Saída esperada:*
+
+Saída obtida:
+
 ```text
 Teste de decodificação:
   source: MAIN
@@ -351,37 +85,142 @@ Teste de decodificação:
   flame_active: True
   temperature_celsius: 42
   temperature_code: 5
+  power_exhaust_raw: 0
   diag_code_hex: 0x20
+  has_error: False
   checksum_valid: True
+  parity_valid: False
+  raw_hex: 57 40 15 00 20 22
+
+Dica: Para monitoramento contínuo em tempo real, use: python3 decoder.py --watch
 ```
 
-### B. Sniffer em Tempo Real Conectado ao Bus Pirate:
+`parity_valid: False` é o resultado desse pacote de teste: nem todo byte tem paridade ímpar. O checksum XOR confere.
+
+Decodificar seis bytes informados na linha de comando:
+
 ```bash
-cd tools
-python3 bp_capture.py --host 192.168.68.112
+python3 tools/decoder.py 57 40 15 00 20 22
 ```
-O script estabelece um WebSocket direto com o Bus Pirate, ativa o modo bridge e analisa os quadros recebidos em tempo real.
 
----
+Monitor contínuo. Em um terminal, sem `--host`, o programa gera pacotes simulados. Com stdin redirecionado, lê linhas hexadecimais. Com `--host`, abre WebSocket em `/ws` e envia `bridge`.
 
-## 9. Compilação e Gravação do Firmware ESP32
+```bash
+python3 tools/decoder.py --watch --no-color
+python3 tools/decoder.py --watch --host <ip-do-bus-pirate> --port 80
+```
 
-Requisitos: [PlatformIO Core (CLI)](https://docs.platformio.org/en/latest/core/installation/index.html) ou extensão PlatformIO no VS Code.
+Ajuda: `python3 tools/decoder.py --help` e `python3 tools/bp_capture.py --help`.
+
+Sniffer WebSocket (o padrão de `--host` está no código; passe o IP do aparelho):
+
+```bash
+python3 tools/bp_capture.py --host <ip-do-bus-pirate> --port 80
+```
+
+### Ferramentas de serial
+
+Exigem PySerial e o Bus Pirate na porta configurada em `PORT`. Não foram executadas aqui (não há dispositivo serial nem o módulo `serial`).
+
+| Comando | O que faz |
+| :--- | :--- |
+| `./run_dashboard.sh` | Sobe `tools/live_dashboard.py`. Prefere `~/.platformio/penv/bin/python3` e cai para `python3`. Pode ser chamado de outro diretório. |
+| `./run_collector.sh` | Sobe `tools/interactive_collector.py` (35 °C a 46 °C, grava `tools/captured_temps.json`). Mesma escolha de interpretador. |
+| `./run_power_collector.sh` | Chama `~/.platformio/penv/bin/python3 tools/power_state_collector.py` sem fallback. O caminho é relativo: rode da raiz do repositório. Temperaturas pedidas: 38, 42, 47, 48, 50 e 60 °C. Grava `tools/power_states.json`. |
+| `python3 tools/bp_temp_sniffer.py` | UART a 2800 baud no pino 25 e imprime a temperatura calculada por `live_dashboard.calculate_temperature`. |
+| `python3 tools/bp_live_monitor.py` | Mede G25 e G26 em modo DIO e dispara `sniff` quando há atividade. |
+| `python3 tools/bp_grove_monitor.py` | O mesmo para a porta Grove, pinos G32 e G33. |
+| `python3 tools/bp_serial_sniff.py --pin 25 --sniff-duration 10` | Lê estado e frequência dos pinos 0, 25 e 26 e faz `sniff` no pino escolhido. |
+
+O painel e os coletores são interativos: ajustam o aquecedor no painel físico e, nos coletores, confirmam cada passo com Enter (`s` pula, `q` encerra).
+
+### Firmware ESP32 (PlatformIO)
+
+Definido em `firmware/platformio.ini` (`monitor_speed` 115200). Com o [PlatformIO Core](https://docs.platformio.org/en/latest/core/installation/index.html) instalado:
 
 ```bash
 cd firmware
-
-# Compilar o código
 pio run
-
-# Gravar no ESP32 conectado via USB
 pio run --target upload
-
-# Abrir o monitor serial
-pio device monitor -b 115200
+pio device monitor
 ```
 
-### Comandos Interativos no Monitor Serial:
-* Pressione `+` para enviar pulso de aumento de temperatura.
-* Pressione `-` para enviar pulso de diminuição de temperatura.
-* Pressione `p` para enviar pulso de Liga/Desliga (Power Toggle).
+No monitor serial, o sketch aceita:
+
+- `+` — temperatura para cima
+- `-` — temperatura para baixo
+- `p` ou `P` — liga/desliga
+
+Esses comandos estão em `firmware/src/main.cpp`. A placa não foi gravada neste ambiente.
+
+### Firmware ESP32-C3
+
+Abra `firmware_c3/firmware_c3.ino` no ambiente Arduino da placa ESP32-C3 Super Mini, ajuste `WIFI_SSID` e `WIFI_PASS`, e grave pela USB. Não há script de build no repositório.
+
+Com Wi-Fi associado, a interface fica em `http://<ip-da-placa>/` e, se o mDNS responder, em `http://rinnai.local/`. Endpoints implementados:
+
+- `GET /` — página com temperatura, estado, chama, diagnóstico, contagem de pacotes e hex bruto
+- `GET /api/status` — JSON desses campos, mais idade do último pacote e RSSI
+- `GET` ou `POST /api/button?action=up|down|power` — injeta o clique correspondente
+
+A página consulta `/api/status` a cada 1 s.
+
+## Protocolo, em resumo
+
+O chicote documentado em [`docs/physical_layer.md`](docs/physical_layer.md) tem quatro vias: +5 V, GND, telemetria da central para o painel (5 V TTL) e comandos do painel para a central (5 V TTL). Os GPIO do ESP32 não são tolerantes a 5 V. A nota recomenda divisor 10 kΩ / 20 kΩ na recepção (no firmware PlatformIO, GPIO 5). O nível alto de 3,3 V na transmissão (GPIO 15 nesse firmware) é tratado na mesma nota como suficiente para o limiar TTL da central. O sketch C3 comenta a ligação direta: GPIO 4 no TX da central e GPIO 5 no RX da central.
+
+Uma UART a cerca de 2800 baud enxerga o sinal como uma sequência cheia de `U` (`0x55`). [`docs/physical_layer.md`](docs/physical_layer.md) registra deltas de borda próximos de 370 µs, 1108 µs, 1847 µs e 7200 µs. O encoder em `firmware/include/rinnai_encoder.h` usa outro conjunto de constantes: período de 600 µs, bit 0 com 150 µs em alto, bit 1 com 450 µs em alto, e pulso de reset de 1200 µs. O decodificador aceita período de símbolo entre 450 µs e 800 µs, trata duração em alto acima de 300 µs como bit 1, e ressincroniza quando o pulso passa de 900 µs.
+
+No modelo de 6 bytes usado pelo firmware e por `tools/decoder.py`:
+
+- 6 bytes, bit menos significativo primeiro.
+- O bit 7 de cada byte é paridade ímpar.
+- O byte 5 é o XOR dos bytes 0 a 4.
+- Telemetria: bit 6 do byte 1 indica ligado; bit 3 do byte 1 entra na temperatura de 35 °C; bit 4 do byte 2 indica chama; os bits 0–3 do byte 2 são o código de temperatura; o byte 4 é diagnóstico (`0x20` no código significa sem erro).
+- Temperatura implementada: código 0 com o bit `0x08` do byte 1 → 35 °C; códigos 0–11 → 37 °C + código; código 12 → 50 °C; 13 → 55 °C; 14 → 60 °C.
+- Comando de botão: byte 4 fixo em `0xBF`; power no bit 0 do byte 1; temperatura `+` no bit 0 do byte 2; temperatura `-` no bit 1 do byte 2. O encoder calcula paridade e checksum antes de transmitir.
+
+O mapeamento campo a campo, a tabela de temperatura e o pacote de comando estão em [`docs/protocol_spec.md`](docs/protocol_spec.md). Comparações de captura (incluindo chama apagada e acesa) estão em [`docs/captures_and_analysis.md`](docs/captures_and_analysis.md).
+
+O painel Python não usa esse pacote de 6 bytes. Ele procura um quadro de 63 bytes, estima chama pela contagem de bytes `0x77` e calcula a temperatura em `calculate_temperature`.
+
+## Estrutura
+
+```text
+├── README.md
+├── LICENSE
+├── docs/
+│   ├── physical_layer.md
+│   ├── protocol_spec.md
+│   └── captures_and_analysis.md
+├── firmware/                      # PlatformIO, ESP32
+│   ├── platformio.ini
+│   ├── include/rinnai_decoder.h
+│   ├── include/rinnai_encoder.h
+│   └── src/main.cpp
+├── firmware_c3/
+│   └── firmware_c3.ino            # ESP32-C3, Wi-Fi e HTTP
+├── run_collector.sh
+├── run_dashboard.sh
+├── run_power_collector.sh
+└── tools/
+    ├── decoder.py
+    ├── bp_capture.py              # WebSocket
+    ├── bp_serial_sniff.py
+    ├── bp_live_monitor.py         # G25 e G26
+    ├── bp_grove_monitor.py        # G32 e G33
+    ├── bp_temp_sniffer.py
+    ├── live_dashboard.py
+    ├── interactive_collector.py
+    ├── power_state_collector.py
+    ├── captured_temps.json
+    ├── captured_39.json
+    ├── captured_40.json
+    └── power_states.json
+```
+
+`.gitignore` ignora `__pycache__/`, `*.pyc`, `.DS_Store`, `.pio/` e `.vscode/`.
+
+## Licença
+
+MIT. Copyright (c) 2026 Wesley Salmi. Texto completo em [`LICENSE`](LICENSE).
