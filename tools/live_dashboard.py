@@ -142,10 +142,10 @@ def calculate_temperature(frame_bytes: bytes) -> Optional[int]:
             return 46
     elif last_byte == 0x0D:
         if byte_60 == 0x11:
-            return 42
+            return 42 if frame_bytes[-12] == 0x14 else 38
         elif frame_bytes[-12] == 0x14:
             return 47
-        return 38
+        return 37
     elif last_byte == 0x0C:
         # 40°C possui Byte 61 = 0x14; 39°C possui Byte 61 = 0x51
         return 40 if byte_61 == 0x14 else 39

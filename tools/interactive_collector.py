@@ -43,14 +43,26 @@ def init_serial():
     ser.read_all()
     return ser
 
+def flush_stale_serial(ser, drain_window=0.35):
+    """Esvazia completamente o buffer serial/USB e a FIFO da bridge antes de capturar."""
+    ser.reset_input_buffer()
+    deadline = time.time() + drain_window
+    while time.time() < deadline:
+        waiting = getattr(ser, "in_waiting", 0)
+        chunk = ser.read(waiting if waiting else 256)
+        if not chunk:
+            time.sleep(0.02)
+
+
 def capture_frames(ser, count=3, max_seconds=3.0):
     """Captura 'count' quadros consecutivos de 63 bytes alinhados pelo preâmbulo."""
     frames = []
     buf = bytearray()
     t0 = time.time()
 
-    # Descarta dados acumulados antes da medição
-    ser.read_all()
+    # Descarta dados represados antes da medição e aguarda o próximo preâmbulo completo
+    flush_stale_serial(ser)
+    synced = False
 
     while len(frames) < count and (time.time() - t0) < max_seconds:
         chunk = ser.read(128)
@@ -65,8 +77,12 @@ def capture_frames(ser, count=3, max_seconds=3.0):
                 if len(buf) < idx + 63:
                     break
                 frame = bytes(buf[idx : idx + 63])
-                frames.append(frame)
                 buf = buf[idx + 63 :]
+                if not synced:
+                    # Descarta o primeiro quadro alinhado para evitar restos na FIFO da bridge
+                    synced = True
+                    continue
+                frames.append(frame)
                 if len(frames) >= count:
                     break
 
@@ -101,6 +117,7 @@ def main():
             dataset = {}
 
     try:
+        prev_hex = None
         for temp in TARGET_TEMPS:
             print("\n" + "-" * 65)
             prompt = f"👉 Ajuste o painel para [{temp}°C] e pressione [ENTER] para capturar (ou 's' para pular, 'q' para sair): "
@@ -128,6 +145,18 @@ def main():
             # Seleciona o quadro mais comum
             hex_frames = [f.hex() for f in frames]
             chosen_hex = max(set(hex_frames), key=hex_frames.count)
+            if chosen_hex == prev_hex:
+                print("\n    ⚠️ Quadro idêntico à leitura anterior! Descartando FIFO e recapturando...", end="", flush=True)
+                time.sleep(0.4)
+                retry_frames = capture_frames(ser, count=4, max_seconds=4.0)
+                if retry_frames:
+                    hex_frames = [f.hex() for f in retry_frames]
+                    chosen_hex = max(set(hex_frames), key=hex_frames.count)
+                    frames = retry_frames
+                if chosen_hex == prev_hex:
+                    print(f"\n    ⚠️ Atenção: o quadro de {temp}°C continuou igual ao anterior! Verifique se o painel mudou de temperatura.")
+
+            prev_hex = chosen_hex
             chosen_bytes = bytes.fromhex(chosen_hex)
 
             tail_hex = chosen_bytes[-12:].hex(" ")

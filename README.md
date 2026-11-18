@@ -32,6 +32,7 @@ O projeto inclui documentação técnica aprofundada, ferramentas de análise em
    - [Transmissão e Injeção de Comandos no TX](#transmissão-e-injeção-de-comandos-no-tx)
 8. [Uso das Ferramentas Python](#8-uso-das-ferramentas-python)
 9. [Compilação e Gravação do Firmware ESP32](#9-compilação-e-gravação-do-firmware-esp32)
+10. [Integração Zigbee2MQTT & HomeKit (M5NanoC6 + HY-M154 Tri-State)](#10-integração-zigbee2mqtt--homekit-m5nanoc6--hy-m154-tri-state)
 
 ---
 
@@ -43,17 +44,28 @@ rinnai-remote/
 ├── docs/                          # Documentação detalhada complementar
 │   ├── physical_layer.md          # Níveis elétricos, divisores de tensão e osciladores
 │   ├── protocol_spec.md           # Detalhes de quadros, paridade e comandos do painel
-│   └── captures_and_analysis.md   # Logs reais brutos (Standby vs Chuveiro a 42°C)
+│   ├── captures_and_analysis.md   # Logs reais brutos (Standby vs Chuveiro a 42°C)
+│   └── nanoc6_hym154_wiring.md    # Esquema M5NanoC6 + HY-M154 Tri-State + Z2M/HomeKit
 ├── tools/                         # Utilitários de captura e decodificação
 │   ├── bp_capture.py              # Sniffer em tempo real via WebSocket do Bus Pirate
 │   └── decoder.py                 # Biblioteca Python de validação, paridade e desempacotamento
-└── firmware/                      # Código C++ para ESP32 (PlatformIO)
-    ├── platformio.ini             # Configuração do ambiente esp32dev
-    ├── include/
-    │   ├── rinnai_decoder.h       # Decodificador não-bloqueante por interrupção GPIO
-    │   └── rinnai_encoder.h       # Gerador de pulsos para injeção de botões (+, -, power)
-    └── src/
-        └── main.cpp               # Aplicação principal (Monitor Serial + comandos)
+├── firmware/                      # Código C++ para ESP32 (PlatformIO)
+│   ├── platformio.ini             # Configuração do ambiente esp32dev
+│   ├── include/
+│   │   ├── rinnai_decoder.h       # Decodificador não-bloqueante por interrupção GPIO
+│   │   └── rinnai_encoder.h       # Gerador de pulsos para injeção de botões (+, -, power)
+│   └── src/
+│       └── main.cpp               # Aplicação principal (Monitor Serial + comandos)
+├── firmware_nanoc6/               # Firmware Zigbee End Device para M5Stack M5NanoC6
+│   ├── platformio.ini             # Ambiente ESP32-C6 (pioarduino) com Zigbee ED
+│   ├── include/
+│   │   ├── rinnai_uart_decoder.h      # Receptor UART 2800 baud + detector de chama 0x77
+│   │   ├── rinnai_tristate_buttons.h  # Controle Tri-State (G2) + trava anti-loop
+│   │   └── rinnai_zigbee_thermostat.h # Endpoint ZCL Thermostat (Cluster 0x0201)
+│   ├── src/main.cpp
+│   └── rinnai_nanoc6_zigbee/      # Sketch standalone para Arduino IDE 2.x
+└── z2m/
+    └── rinnai_nanoc6.js           # External converter para Zigbee2MQTT (35°C–48°C)
 ```
 
 ---
@@ -385,3 +397,21 @@ pio device monitor -b 115200
 * Pressione `+` para enviar pulso de aumento de temperatura.
 * Pressione `-` para enviar pulso de diminuição de temperatura.
 * Pressione `p` para enviar pulso de Liga/Desliga (Power Toggle).
+
+---
+
+## 10. Integração Zigbee2MQTT & HomeKit (M5NanoC6 + HY-M154 Tri-State)
+
+> [!NOTE]
+> A injeção direta de pacotes no fio `RX` da central pode causar colisão elétrica (*bus contention*) com o painel frontal original, fazendo o painel entrar em estado de erro. Para uso definitivo em produção com **M5Stack M5NanoC6**, **Zigbee2MQTT** e **Homebridge (HomeKit)**, recomenda-se a abordagem **100% passiva na linha TX + acionamento optoisolado nos botões físicos (`+` e `-`)**.
+
+### Arquitetura da Solução
+1. **Leitura Passiva (`G1`):** O M5NanoC6 escuta o fio `TX` da central em `2800 baud` via divisor resistivo ($10\,\text{k}\Omega / 20\,\text{k}\Omega$), mantendo alta impedância sem interferir no barramento.
+2. **Atuação Tri-State (`G2` + HY-M154):** Usando apenas o pino `G2` do conector Grove em três estados (`INPUT Hi-Z`, `OUTPUT HIGH` e `OUTPUT LOW`) ligado a dois canais do módulo optoacoplador **HY-M154 (PC817)**, o firmware aciona os botões físicos `+` e `-` com isolamento galvânico total.
+3. **Malha Fechada + Trava Anti-Loop:** Ajustes solicitados pelo HomeKit são limitados à faixa segura de banho (**35°C a 48°C**, passo `1°C`) e verificados quadro a quadro. Se após 2 cliques a temperatura real não mudar (ex: trava de segurança $>42^\circ\text{C}$ durante o banho), os cliques são interrompidos e o setpoint é sincronizado com o painel.
+4. **Zigbee2MQTT & HomeKit (`homebridge-z2m`):** Exposto como Termostato Zigbee (`Rinnai-NanoC6`) com indicador de chama ativa (`running_state: heat` $\rightarrow$ status *Aquecendo* no app Casa) e `system_mode` espelhando o estado físico do botão Power.
+
+Consulte o guia passo a passo completo (esquema elétrico nos bornes do HY-M154, isolamento, gravação e configuração do Z2M):
+* [docs/nanoc6_hym154_wiring.md](file:///Users/wesleysalmi/source-me/rinnai-remote/docs/nanoc6_hym154_wiring.md)
+* [firmware_nanoc6/platformio.ini](file:///Users/wesleysalmi/source-me/rinnai-remote/firmware_nanoc6/platformio.ini) | [rinnai_nanoc6_zigbee.ino](file:///Users/wesleysalmi/source-me/rinnai-remote/firmware_nanoc6/rinnai_nanoc6_zigbee/rinnai_nanoc6_zigbee.ino)
+* [z2m/rinnai_nanoc6.js](file:///Users/wesleysalmi/source-me/rinnai-remote/z2m/rinnai_nanoc6.js)

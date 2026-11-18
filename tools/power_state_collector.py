@@ -43,11 +43,23 @@ def init_serial():
     ser.read_all()
     return ser
 
+def flush_stale_serial(ser, drain_window=0.35):
+    """Esvazia completamente o buffer serial/USB e a FIFO da bridge antes de capturar."""
+    ser.reset_input_buffer()
+    deadline = time.time() + drain_window
+    while time.time() < deadline:
+        waiting = getattr(ser, "in_waiting", 0)
+        chunk = ser.read(waiting if waiting else 256)
+        if not chunk:
+            time.sleep(0.02)
+
+
 def capture_frames(ser, count=3, max_seconds=3.5):
     frames = []
     buf = bytearray()
     t0 = time.time()
-    ser.read_all()
+    flush_stale_serial(ser)
+    synced = False
 
     while len(frames) < count and (time.time() - t0) < max_seconds:
         chunk = ser.read(128)
@@ -62,8 +74,11 @@ def capture_frames(ser, count=3, max_seconds=3.5):
                 if len(buf) < idx + 63:
                     break
                 frame = bytes(buf[idx : idx + 63])
-                frames.append(frame)
                 buf = buf[idx + 63 :]
+                if not synced:
+                    synced = True
+                    continue
+                frames.append(frame)
                 if len(frames) >= count:
                     break
 
@@ -153,6 +168,7 @@ def main():
             dataset = {}
 
     try:
+        prev_on_hex = None
         for temp in DEFAULT_TEMPS:
             print("\n" + "#" * 70)
             print(f"            >>> ETAPA: TEMPERATURA {temp}°C <<<")
@@ -170,6 +186,15 @@ def main():
                 print(" ❌ Nenhum quadro recebido. Verifique a conexão.")
                 continue
             chosen_on = max(set([f.hex() for f in frames_on]), key=[f.hex() for f in frames_on].count)
+            if chosen_on == prev_on_hex:
+                print("\n    ⚠️ Quadro LIGADO idêntico à etapa anterior! Recapturando após flush...", end="", flush=True)
+                time.sleep(0.4)
+                retry_on = capture_frames(ser, count=4)
+                if retry_on:
+                    chosen_on = max(set([f.hex() for f in retry_on]), key=[f.hex() for f in retry_on].count)
+                if chosen_on == prev_on_hex:
+                    print("\n    ⚠️ Atenção: o quadro LIGADO continuou igual à etapa anterior!")
+            prev_on_hex = chosen_on
             f_on_bytes = bytes.fromhex(chosen_on)
             print(f" ✔ OK! Tail: {f_on_bytes[-8:].hex(' ')}")
 
@@ -183,6 +208,14 @@ def main():
                 print(" ❌ Nenhum quadro recebido.")
                 continue
             chosen_off = max(set([f.hex() for f in frames_off]), key=[f.hex() for f in frames_off].count)
+            if chosen_off == chosen_on:
+                print("\n    ⚠️ Quadro DESLIGADO idêntico ao LIGADO! Recapturando após flush...", end="", flush=True)
+                time.sleep(0.4)
+                retry_off = capture_frames(ser, count=4)
+                if retry_off:
+                    chosen_off = max(set([f.hex() for f in retry_off]), key=[f.hex() for f in retry_off].count)
+                if chosen_off == chosen_on:
+                    print("\n    ⚠️ Atenção: o quadro DESLIGADO continuou idêntico ao LIGADO!")
             f_off_bytes = bytes.fromhex(chosen_off)
             print(f" ✔ OK! Tail: {f_off_bytes[-8:].hex(' ')}")
 
