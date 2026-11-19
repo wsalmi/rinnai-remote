@@ -8,14 +8,21 @@
 #include "Zigbee.h"
 #include "esp_zigbee_core.h"
 
+// Versão do firmware (OTA): incrementar a cada build publicado. Formato 0xMMmmpppp.
+#ifndef RINNAI_FW_VERSION
+#define RINNAI_FW_VERSION 0x00010007
+#endif
+#define RINNAI_OTA_MANUFACTURER 0x1001
+#define RINNAI_OTA_IMAGE_TYPE   0x1011
+
 /**
  * @brief Endpoint Zigbee HA Thermostat (Cluster 0x0201 - Server Role) para aquecedor Rinnai.
  *
  * Atributos expostos e reportados ao Zigbee2MQTT / HomeKit:
  * - LocalTemperature (0x0000): Temperatura atual decodificada na linha TX da central.
- * - OccupiedHeatingSetpoint (0x0012): Alvo controlado pelos botões '+' / '-' (35°C a 48°C).
- * - SystemMode (0x001C): Espelho do estado físico Power ON (Heat) / Standby (Off);
- *   comandos remotos de troca de modo são revertidos para refletir o painel físico.
+ * - OccupiedHeatingSetpoint (0x0012): Alvo controlado pelos botões '+' / '-' (35°C a 43°C).
+ * - SystemMode (0x001C): Espelho do estado da chama (Heat com chama acesa / Off caso contrário);
+ *   comandos remotos de troca de modo são revertidos para refletir o estado real do aquecedor.
  * - ThermostatRunningState (0x0029): Bit 0 (0x0001 = Heat On) quando a chama está acesa.
  */
 class RinnaiZigbeeThermostat : public ZigbeeEP {
@@ -37,14 +44,50 @@ public:
         esp_zb_attribute_list_t *identify_cluster = esp_zb_identify_cluster_create(&identify_cfg);
         esp_zb_cluster_list_add_identify_cluster(_cluster_list, identify_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
-        esp_zb_thermostat_cluster_cfg_t thermostat_cfg = {
-            .local_temperature = 4000,
-            .occupied_cooling_setpoint = 6000,
-            .occupied_heating_setpoint = 4000,
-            .control_sequence_of_operation = ESP_ZB_ZCL_THERMOSTAT_CONTROL_SEQ_OF_OPERATION_HEATING_ONLY,
-            .system_mode = ESP_ZB_ZCL_THERMOSTAT_SYSTEM_MODE_HEAT,
-        };
-        esp_zb_attribute_list_t *thermostat_cluster = esp_zb_thermostat_cluster_create(&thermostat_cfg);
+        // Cria o cluster manualmente para garantir ESP_ZB_ZCL_ATTR_ACCESS_REPORTING em 0x0012 e 0x001C
+        // (esp_zb_thermostat_cluster_create() omite ACCESS_REPORTING nesses dois atributos).
+        esp_zb_attribute_list_t *thermostat_cluster =
+            esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT);
+        esp_zb_cluster_add_attr(
+            thermostat_cluster,
+            ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT,
+            ESP_ZB_ZCL_ATTR_THERMOSTAT_LOCAL_TEMPERATURE_ID,
+            ESP_ZB_ZCL_ATTR_TYPE_S16,
+            ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
+            &_localTempAttr
+        );
+        esp_zb_cluster_add_attr(
+            thermostat_cluster,
+            ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT,
+            ESP_ZB_ZCL_ATTR_THERMOSTAT_OCCUPIED_COOLING_SETPOINT_ID,
+            ESP_ZB_ZCL_ATTR_TYPE_S16,
+            ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE | ESP_ZB_ZCL_ATTR_ACCESS_SCENE,
+            &_occCoolSetpointAttr
+        );
+        esp_zb_cluster_add_attr(
+            thermostat_cluster,
+            ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT,
+            ESP_ZB_ZCL_ATTR_THERMOSTAT_OCCUPIED_HEATING_SETPOINT_ID,
+            ESP_ZB_ZCL_ATTR_TYPE_S16,
+            ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING | ESP_ZB_ZCL_ATTR_ACCESS_SCENE,
+            &_occHeatSetpointAttr
+        );
+        esp_zb_cluster_add_attr(
+            thermostat_cluster,
+            ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT,
+            ESP_ZB_ZCL_ATTR_THERMOSTAT_CONTROL_SEQUENCE_OF_OPERATION_ID,
+            ESP_ZB_ZCL_ATTR_TYPE_8BIT_ENUM,
+            ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE,
+            &_ctrlSeqAttr
+        );
+        esp_zb_cluster_add_attr(
+            thermostat_cluster,
+            ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT,
+            ESP_ZB_ZCL_ATTR_THERMOSTAT_SYSTEM_MODE_ID,
+            ESP_ZB_ZCL_ATTR_TYPE_8BIT_ENUM,
+            ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING | ESP_ZB_ZCL_ATTR_ACCESS_SCENE,
+            &_systemModeAttr
+        );
 
         struct LimitAttr {
             uint16_t id;
@@ -86,6 +129,10 @@ public:
             .app_device_id = _device_id,
             .app_device_version = 0,
         };
+
+        // Cliente OTA (cluster 0x0019): permite atualizar via Zigbee2MQTT sem USB
+        addOTAClient(RINNAI_FW_VERSION, RINNAI_FW_VERSION, 1,
+                     RINNAI_OTA_MANUFACTURER, RINNAI_OTA_IMAGE_TYPE);
     }
 
     void markStarted() {
@@ -102,15 +149,23 @@ public:
         };
         AttrInit attrs[] = {
             {ESP_ZB_ZCL_ATTR_THERMOSTAT_ABS_MIN_HEAT_SETPOINT_LIMIT_ID, 3500},
-            {ESP_ZB_ZCL_ATTR_THERMOSTAT_ABS_MAX_HEAT_SETPOINT_LIMIT_ID, 4800},
+            {ESP_ZB_ZCL_ATTR_THERMOSTAT_ABS_MAX_HEAT_SETPOINT_LIMIT_ID, 4300},
             {ESP_ZB_ZCL_ATTR_THERMOSTAT_MIN_HEAT_SETPOINT_LIMIT_ID,     3500},
-            {ESP_ZB_ZCL_ATTR_THERMOSTAT_MAX_HEAT_SETPOINT_LIMIT_ID,     4800},
+            {ESP_ZB_ZCL_ATTR_THERMOSTAT_MAX_HEAT_SETPOINT_LIMIT_ID,     4300},
             {ESP_ZB_ZCL_ATTR_THERMOSTAT_ABS_MIN_COOL_SETPOINT_LIMIT_ID, 5000},
             {ESP_ZB_ZCL_ATTR_THERMOSTAT_ABS_MAX_COOL_SETPOINT_LIMIT_ID, 7000},
             {ESP_ZB_ZCL_ATTR_THERMOSTAT_MIN_COOL_SETPOINT_LIMIT_ID,     5000},
             {ESP_ZB_ZCL_ATTR_THERMOSTAT_MAX_COOL_SETPOINT_LIMIT_ID,     7000},
             {ESP_ZB_ZCL_ATTR_THERMOSTAT_OCCUPIED_COOLING_SETPOINT_ID,   6000},
         };
+
+        static const uint16_t reportableAttrs[] = {
+            ESP_ZB_ZCL_ATTR_THERMOSTAT_LOCAL_TEMPERATURE_ID,
+            ESP_ZB_ZCL_ATTR_THERMOSTAT_OCCUPIED_HEATING_SETPOINT_ID,
+            ESP_ZB_ZCL_ATTR_THERMOSTAT_SYSTEM_MODE_ID,
+            ESP_ZB_ZCL_ATTR_THERMOSTAT_THERMOSTAT_RUNNING_STATE_ID,
+        };
+        uint16_t failedRepAttr = 0;
 
         esp_zb_lock_acquire(portMAX_DELAY);
         for (auto &entry : attrs) {
@@ -123,10 +178,18 @@ public:
                 false
             );
         }
+        for (uint16_t attrId : reportableAttrs) {
+            if (!ensureReportingInfoLocked(attrId) && failedRepAttr == 0) {
+                failedRepAttr = attrId;
+            }
+        }
         esp_zb_lock_release();
 
         _limitsApplied = true;
-        Serial.println("[ZIGBEE] Limites do Thermostat aplicados (Heat: 35-48°C, Cool: 60°C)");
+        Serial.println("[ZIGBEE] Limites do Thermostat aplicados (Heat: 35-43°C, Cool: 60°C)");
+        if (failedRepAttr != 0) {
+            Serial.printf("[ZIGBEE] AVISO: falha ao registrar reporting_info para 0x%04X\n", failedRepAttr);
+        }
     }
 
     void setPhysicalPowerState(bool powerOn) {
@@ -235,12 +298,42 @@ protected:
     }
 
 private:
+    bool ensureReportingInfoLocked(uint16_t attrId) {
+        esp_zb_zcl_attr_location_info_t loc = {};
+        loc.endpoint_id = _endpoint;
+        loc.cluster_id = ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT;
+        loc.cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE;
+        loc.manuf_code = ESP_ZB_ZCL_ATTR_NON_MANUFACTURER_SPECIFIC;
+        loc.attr_id = attrId;
+        if (esp_zb_zcl_find_reporting_info(loc) != nullptr) {
+            return true;
+        }
+        esp_zb_zcl_reporting_info_t rep = {};
+        rep.direction = ESP_ZB_ZCL_REPORT_DIRECTION_SEND;
+        rep.ep = _endpoint;
+        rep.cluster_id = ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT;
+        rep.cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE;
+        rep.attr_id = attrId;
+        rep.u.send_info.min_interval = 1;
+        rep.u.send_info.max_interval = 0;
+        rep.u.send_info.def_min_interval = 1;
+        rep.u.send_info.def_max_interval = 0;
+        rep.dst.profile_id = ESP_ZB_AF_HA_PROFILE_ID;
+        rep.manuf_code = ESP_ZB_ZCL_ATTR_NON_MANUFACTURER_SPECIFIC;
+        esp_err_t err = esp_zb_zcl_update_reporting_info(&rep);
+        return (err == ESP_OK) && (esp_zb_zcl_find_reporting_info(loc) != nullptr);
+    }
+
     void setAndReportAttr(uint16_t attrId, void *valuePtr, bool sendReport) {
         if (!_stackReady || !Zigbee.started()) return;
         applySetpointLimits();
 
+        bool didReport = false;
+        esp_zb_zcl_status_t setStatus = ESP_ZB_ZCL_STATUS_SUCCESS;
+        esp_err_t repErr = ESP_OK;
+
         esp_zb_lock_acquire(portMAX_DELAY);
-        esp_zb_zcl_set_attribute_val(
+        setStatus = esp_zb_zcl_set_attribute_val(
             _endpoint,
             ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT,
             ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
@@ -250,22 +343,52 @@ private:
         );
 
         if (sendReport && Zigbee.connected()) {
-            esp_zb_zcl_report_attr_cmd_t reportCmd = {};
-            reportCmd.address_mode = ESP_ZB_APS_ADDR_MODE_DST_ADDR_ENDP_NOT_PRESENT;
-            reportCmd.attributeID = attrId;
-            reportCmd.direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI;
-            reportCmd.clusterID = ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT;
-            reportCmd.zcl_basic_cmd.src_endpoint = _endpoint;
-            reportCmd.manuf_specific = 0;
-            esp_zb_zcl_report_attr_cmd_req(&reportCmd);
+            didReport = true;
+            if (ensureReportingInfoLocked(attrId)) {
+                esp_zb_zcl_report_attr_cmd_t reportCmd = {};
+                reportCmd.address_mode = ESP_ZB_APS_ADDR_MODE_DST_ADDR_ENDP_NOT_PRESENT;
+                reportCmd.attributeID = attrId;
+                reportCmd.direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI;
+                reportCmd.clusterID = ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT;
+                reportCmd.zcl_basic_cmd.src_endpoint = _endpoint;
+                reportCmd.manuf_specific = 0;
+                repErr = esp_zb_zcl_report_attr_cmd_req(&reportCmd);
+            } else {
+                repErr = ESP_ERR_NOT_FOUND;
+            }
         }
         esp_zb_lock_release();
+
+        if (setStatus != ESP_ZB_ZCL_STATUS_SUCCESS) {
+            Serial.printf("[ZIGBEE] Set attr 0x%04X falhou: 0x%02X\n", attrId, (unsigned)setStatus);
+        }
+        if (didReport) {
+            if (repErr != ESP_OK) {
+                Serial.printf("[ZIGBEE] Report attr 0x%04X falhou: 0x%x (%s)\n",
+                              attrId, repErr, esp_err_to_name(repErr));
+            } else if (attrId == ESP_ZB_ZCL_ATTR_THERMOSTAT_OCCUPIED_HEATING_SETPOINT_ID) {
+                Serial.printf("[ZIGBEE] Report 0x%04X OK (val=%d)\n",
+                              attrId, (int)(*(const int16_t *)valuePtr));
+            } else if (attrId == ESP_ZB_ZCL_ATTR_THERMOSTAT_SYSTEM_MODE_ID) {
+                Serial.printf("[ZIGBEE] Report 0x%04X OK (val=%d)\n",
+                              attrId, (int)(*(const uint8_t *)valuePtr));
+            } else if (attrId == ESP_ZB_ZCL_ATTR_THERMOSTAT_THERMOSTAT_RUNNING_STATE_ID) {
+                Serial.printf("[ZIGBEE] Report 0x%04X OK (val=%d)\n",
+                              attrId, (int)(*(const uint16_t *)valuePtr));
+            }
+        }
     }
 
+    int16_t _localTempAttr = 4000;
+    int16_t _occCoolSetpointAttr = 6000;
+    int16_t _occHeatSetpointAttr = 4000;
+    uint8_t _ctrlSeqAttr = ESP_ZB_ZCL_THERMOSTAT_CONTROL_SEQ_OF_OPERATION_HEATING_ONLY;
+    uint8_t _systemModeAttr = ESP_ZB_ZCL_THERMOSTAT_SYSTEM_MODE_OFF;
+
     int16_t _absMinHeat = 3500;
-    int16_t _absMaxHeat = 4800;
+    int16_t _absMaxHeat = 4300;
     int16_t _minHeatLimit = 3500;
-    int16_t _maxHeatLimit = 4800;
+    int16_t _maxHeatLimit = 4300;
     int16_t _absMinCool = 5000;
     int16_t _absMaxCool = 7000;
     int16_t _minCoolLimit = 5000;
@@ -280,7 +403,7 @@ private:
     portMUX_TYPE _mux = portMUX_INITIALIZER_UNLOCKED;
     bool _stackReady = false;
     bool _limitsApplied = false;
-    volatile bool _physicalPowerOn = true;
+    volatile bool _physicalPowerOn = false;
     volatile bool _hasPendingSetpoint = false;
     volatile int _pendingSetpointC = 40;
     volatile bool _pendingModeRevert = false;

@@ -59,24 +59,27 @@ private:
 #endif
 
 /**
- * @brief Controlador não-bloqueante em malha fechada com trava anti-loop.
+ * @brief Controlador não-bloqueante em malha fechada (1 clique por vez) com wake-up reativo e trava anti-loop.
  *
- * - Limita o setpoint remoto à faixa segura de banho: 35°C a 48°C (passo 1°C).
- * - Quando há leitura de temperatura válida na linha TX, executa um clique por vez,
- *   aguarda o próximo quadro (~225 ms) e confere se a temperatura mudou.
- * - Trava anti-loop: após 2 cliques consecutivos sem alteração da temperatura real
- *   (ex: bloqueio anti-queimadura >42°C durante o banho ou painel travado/standby),
+ * - Limita o setpoint remoto à faixa segura de banho: 35°C a 43°C (passo 1°C).
+ * - Executa 1 clique por vez e monitora a telemetria RMT (que usa debounce de 2 pacotes B3).
+ *   Assim que a temperatura avança na direção esperada (após SETTLE_MIN_MS), prossegue imediatamente;
+ *   caso contrário, aguarda até SETTLE_MAX_MS (1500 ms) sem sair prematuramente por pacotes antigos.
+ * - Wake-up reativo do painel em Idle: se o 1º clique de um comando não alterar a temperatura
+ *   dentro de SETTLE_MAX_MS, assume que apenas acendeu o display sem contar como stall.
+ * - Trava anti-loop: após 2 cliques consecutivos sem mudança após o painel estar acordado
+ *   (ex: bloqueio anti-queimadura >42°C durante o banho) ou ao atingir MAX_TOTAL_CLICKS_PER_CMD,
  *   aborta o ajuste e sincroniza o setpoint do HomeKit de volta para a temperatura real.
  */
 class RinnaiClosedLoopController {
 public:
     static constexpr uint8_t TEMP_MIN = 35;
-    static constexpr uint8_t TEMP_MAX = 48;
+    static constexpr uint8_t TEMP_MAX = 43;
     static constexpr uint32_t PRESS_DURATION_MS = 90;
     static constexpr uint32_t SETTLE_MIN_MS = 280;
-    static constexpr uint32_t SETTLE_MAX_MS = 550;
+    static constexpr uint32_t SETTLE_MAX_MS = 1500;
     static constexpr uint8_t MAX_STALLED_CLICKS = 2;
-    static constexpr uint8_t MAX_BLIND_CLICKS = 15;
+    static constexpr uint8_t MAX_TOTAL_CLICKS_PER_CMD = 20;
 
     enum class State : uint8_t {
         IDLE,
@@ -105,12 +108,17 @@ public:
 
     void setTargetTemperature(int requestedTempC, const RinnaiTelemetryState& telemetry, uint32_t nowMs) {
         uint8_t clamped = clampTargetTemp(requestedTempC);
+        (void)nowMs;
 
         if (!telemetry.valid || telemetry.temperature == 0) {
             // Ainda não há telemetria inicial do barramento; guarda meta até sincronizar
             _targetTemp = clamped;
             _hasPendingTarget = true;
             _stalledClicks = 0;
+            _totalClicksInCmd = 0;
+            if (_state == State::IDLE) {
+                _wakeClickUsed = false;
+            }
             return;
         }
 
@@ -118,7 +126,8 @@ public:
             // Painel fisicamente desligado (Standby): não envia cliques e re-sincroniza HomeKit
             _hasPendingTarget = false;
             _stalledClicks = 0;
-            _blindClicksRemaining = 0;
+            _wakeClickUsed = false;
+            _totalClicksInCmd = 0;
             _targetTemp = clampTargetTemp(telemetry.temperature);
             notifySync(_targetTemp);
             return;
@@ -126,67 +135,34 @@ public:
 
         _targetTemp = clamped;
         _stalledClicks = 0;
+        _totalClicksInCmd = 0;
 
-        if (!telemetry.flameActive && telemetry.temperature == _targetTemp) {
-            _hasPendingTarget = false;
-            _blindClicksRemaining = 0;
-            return;
+        if (_state == State::IDLE) {
+            _wakeClickUsed = false;
+            if (telemetry.temperature == _targetTemp) {
+                _hasPendingTarget = false;
+                return;
+            }
         }
 
         _hasPendingTarget = true;
-        if (telemetry.flameActive) {
-            int baseTemp = (_estimatedTemp >= 35 && _estimatedTemp <= 60)
-                               ? _estimatedTemp
-                               : telemetry.temperature;
-            int diff = (int)_targetTemp - baseTemp;
-            if (diff > MAX_BLIND_CLICKS) diff = MAX_BLIND_CLICKS;
-            if (diff < -MAX_BLIND_CLICKS) diff = -MAX_BLIND_CLICKS;
-            _blindClicksRemaining = (int8_t)diff;
-            _reconcileAfterFlame = true;
-            if (diff == 0) {
-                _hasPendingTarget = false;
-            }
-        } else {
-            _blindClicksRemaining = 0;
-            _reconcileAfterFlame = false;
-        }
-        (void)nowMs;
     }
 
     void update(const RinnaiTelemetryState& telemetry, uint32_t nowMs) {
-        // Sincroniza estimativa inicial na primeira leitura válida
+        // Sincroniza estimativa inicial e publica imediatamente ao Zigbee na primeira leitura válida
         if (telemetry.valid && telemetry.temperature > 0 && _lastObservedTemp == 0) {
             _lastObservedTemp = telemetry.temperature;
-            _estimatedTemp = telemetry.temperature;
             if (!_hasPendingTarget) {
                 _targetTemp = clampTargetTemp(telemetry.temperature);
+                notifySync(_targetTemp);
             }
         }
 
-        // Detecta fim do banho (chama apagada) para reconciliar temperatura real após cliques em chama
-        if (_wasFlameActive && !telemetry.flameActive && telemetry.valid && telemetry.temperature > 0) {
-            _wasFlameActive = false;
-            _blindClicksRemaining = 0;
-            _estimatedTemp = telemetry.temperature;
-            if (_reconcileAfterFlame) {
-                _reconcileAfterFlame = false;
-                _hasPendingTarget = false;
-                _stalledClicks = 0;
-                uint8_t realClamped = clampTargetTemp(telemetry.temperature);
-                _targetTemp = realClamped;
-                _lastObservedTemp = telemetry.temperature;
-                notifySync(realClamped);
-            }
-        } else if (telemetry.flameActive) {
-            _wasFlameActive = true;
-        }
-
-        // Atualiza setpoint no Zigbee se usuário apertou o botão físico no painel em repouso
+        // Atualiza setpoint no Zigbee se usuário apertou o botão físico no painel (com ou sem chama)
         if (_state == State::IDLE && !_hasPendingTarget &&
-            telemetry.valid && !telemetry.flameActive && telemetry.powerOn &&
+            telemetry.valid && telemetry.powerOn &&
             telemetry.temperature > 0 && telemetry.temperature != _lastObservedTemp) {
             _lastObservedTemp = telemetry.temperature;
-            _estimatedTemp = telemetry.temperature;
             uint8_t realClamped = clampTargetTemp(telemetry.temperature);
             _targetTemp = realClamped;
             notifySync(realClamped);
@@ -194,40 +170,39 @@ public:
 
         switch (_state) {
             case State::IDLE: {
-                if (!_hasPendingTarget || !telemetry.valid || !telemetry.powerOn || telemetry.temperature == 0) {
+                if (!_hasPendingTarget || !telemetry.valid || telemetry.temperature == 0) {
+                    return;
+                }
+                if (!telemetry.powerOn) {
+                    abortAndSync(telemetry.temperature);
                     return;
                 }
 
-                RinnaiClickDir dir = RinnaiClickDir::NONE;
-
-                if (telemetry.flameActive) {
-                    if (_blindClicksRemaining > 0) {
-                        dir = RinnaiClickDir::UP;
-                        _blindClicksRemaining--;
-                        if (_estimatedTemp < 60) _estimatedTemp++;
-                    } else if (_blindClicksRemaining < 0) {
-                        dir = RinnaiClickDir::DOWN;
-                        _blindClicksRemaining++;
-                        if (_estimatedTemp > 35) _estimatedTemp--;
-                    } else {
-                        _hasPendingTarget = false;
-                        return;
-                    }
-                } else {
-                    if (telemetry.temperature == _targetTemp) {
-                        _hasPendingTarget = false;
-                        _stalledClicks = 0;
-                        _lastObservedTemp = telemetry.temperature;
-                        return;
-                    }
-                    dir = (_targetTemp > telemetry.temperature) ? RinnaiClickDir::UP : RinnaiClickDir::DOWN;
+                if (telemetry.temperature == _targetTemp) {
+                    _hasPendingTarget = false;
+                    _stalledClicks = 0;
+                    _wakeClickUsed = false;
+                    _totalClicksInCmd = 0;
+                    _lastObservedTemp = telemetry.temperature;
+                    return;
                 }
+
+                if (_totalClicksInCmd >= MAX_TOTAL_CLICKS_PER_CMD) {
+                #ifdef ARDUINO
+                    Serial.printf("[CTRL] Limite maximo de cliques (%u) atingido em %u°C -> abortando\n",
+                                  (unsigned)MAX_TOTAL_CLICKS_PER_CMD, telemetry.temperature);
+                #endif
+                    abortAndSync(telemetry.temperature);
+                    return;
+                }
+
+                RinnaiClickDir dir = (_targetTemp > telemetry.temperature) ? RinnaiClickDir::UP : RinnaiClickDir::DOWN;
 
                 _activeDir = dir;
                 _tempBeforeClick = telemetry.temperature;
-                _tempPktBeforeClick = telemetry.tempPacketCount;
                 _stateStartMs = nowMs;
                 _state = State::PRESSING;
+                _totalClicksInCmd++;
 
                 if (dir == RinnaiClickDir::UP) {
                     _hw.driveUp();
@@ -253,53 +228,97 @@ public:
                     return;
                 }
 
-                bool gotFreshTempPacket = (telemetry.tempPacketCount != _tempPktBeforeClick);
-                if (!gotFreshTempPacket && elapsed < SETTLE_MAX_MS) {
+                if (!_hasPendingTarget) {
+                    _state = State::IDLE;
                     return;
                 }
 
-                // Se temos leitura de temperatura real (repouso ou quadro decodificado durante chama)
-                if (!telemetry.flameActive || gotFreshTempPacket) {
-                    _lastObservedTemp = telemetry.temperature;
-                    _estimatedTemp = telemetry.temperature;
-
-                    if (telemetry.temperature == _targetTemp) {
-                        _hasPendingTarget = false;
-                        _stalledClicks = 0;
-                        _blindClicksRemaining = 0;
-                        _reconcileAfterFlame = false;
+                if (!telemetry.valid || telemetry.temperature == 0) {
+                    if (elapsed >= SETTLE_MAX_MS) {
                         _state = State::IDLE;
-                        return;
                     }
-
-                    bool movedCorrectly =
-                        (_activeDir == RinnaiClickDir::UP && telemetry.temperature > _tempBeforeClick) ||
-                        (_activeDir == RinnaiClickDir::DOWN && telemetry.temperature < _tempBeforeClick);
-
-                    if (movedCorrectly) {
-                        _stalledClicks = 0;
-                    } else {
-                        _stalledClicks++;
-                        if (_stalledClicks >= MAX_STALLED_CLICKS) {
-                            // Trava anti-loop acionada!
-                            _hasPendingTarget = false;
-                            _stalledClicks = 0;
-                            _blindClicksRemaining = 0;
-                            _reconcileAfterFlame = false;
-                            uint8_t realClamped = clampTargetTemp(telemetry.temperature);
-                            _targetTemp = realClamped;
-                            notifySync(realClamped);
-                            _state = State::IDLE;
-                            return;
-                        }
-                    }
-                } else {
-                    // Em chama ativa com quadros 0x77 sem trailer de temperatura
-                    if (_blindClicksRemaining == 0) {
-                        _hasPendingTarget = false;
-                    }
+                    return;
                 }
 
+                if (!telemetry.powerOn) {
+                    abortAndSync(telemetry.temperature);
+                    return;
+                }
+
+                // Confirmação rápida de chegada (exige mudança real em relação ao valor antes do clique)
+                if (telemetry.temperature == _targetTemp && telemetry.temperature != _tempBeforeClick) {
+                #ifdef ARDUINO
+                    Serial.printf("[CTRL] Alvo %u°C atingido (cliques=%u)\n",
+                                  _targetTemp, (unsigned)_totalClicksInCmd);
+                #endif
+                    _lastObservedTemp = telemetry.temperature;
+                    _hasPendingTarget = false;
+                    _stalledClicks = 0;
+                    _wakeClickUsed = false;
+                    _totalClicksInCmd = 0;
+                    _state = State::IDLE;
+                    return;
+                }
+
+                // Confirmação rápida de passo intermediário na direção esperada
+                bool movedCorrectly =
+                    (_activeDir == RinnaiClickDir::UP && telemetry.temperature > _tempBeforeClick) ||
+                    (_activeDir == RinnaiClickDir::DOWN && telemetry.temperature < _tempBeforeClick);
+
+                if (movedCorrectly) {
+                #ifdef ARDUINO
+                    Serial.printf("[CTRL] Passo confirmado: %u°C -> %u°C (alvo=%u°C)\n",
+                                  _tempBeforeClick, telemetry.temperature, _targetTemp);
+                #endif
+                    _lastObservedTemp = telemetry.temperature;
+                    _stalledClicks = 0;
+                    _wakeClickUsed = true;
+                    _state = State::IDLE;
+                    return;
+                }
+
+                // Aguarda pacientemente o debounce RMT (2 pacotes B3) + latência painel->central
+                if (elapsed < SETTLE_MAX_MS) {
+                    return;
+                }
+
+                _lastObservedTemp = telemetry.temperature;
+
+                // Caso o alvo tenha sido revertido durante o clique para o valor atual sem movimento
+                if (telemetry.temperature == _targetTemp) {
+                    _hasPendingTarget = false;
+                    _stalledClicks = 0;
+                    _wakeClickUsed = false;
+                    _totalClicksInCmd = 0;
+                    _state = State::IDLE;
+                    return;
+                }
+
+                // Primeiro clique sem alteração assume despertar do painel em Idle (sem contar como stall)
+                if (!_wakeClickUsed) {
+                    _wakeClickUsed = true;
+                #ifdef ARDUINO
+                    Serial.printf("[CTRL] 1o clique sem mudanca em %u°C (painel Idle despertado); prosseguindo para %u°C\n",
+                                  telemetry.temperature, _targetTemp);
+                #endif
+                    _state = State::IDLE;
+                    return;
+                }
+
+                _stalledClicks++;
+                if (_stalledClicks >= MAX_STALLED_CLICKS) {
+                #ifdef ARDUINO
+                    Serial.printf("[CTRL] Trava anti-loop (%u/%u sem mudanca em %u°C) -> revertendo alvo\n",
+                                  (unsigned)_stalledClicks, (unsigned)MAX_STALLED_CLICKS, telemetry.temperature);
+                #endif
+                    abortAndSync(telemetry.temperature);
+                    return;
+                }
+
+                #ifdef ARDUINO
+                Serial.printf("[CTRL] Clique sem mudanca em %u°C (stall %u/%u); tentando novamente\n",
+                              telemetry.temperature, (unsigned)_stalledClicks, (unsigned)MAX_STALLED_CLICKS);
+                #endif
                 _state = State::IDLE;
                 break;
             }
@@ -310,10 +329,24 @@ public:
     bool hasPendingTarget() const { return _hasPendingTarget; }
     uint8_t targetTemp() const { return _targetTemp; }
     uint8_t stalledClicks() const { return _stalledClicks; }
+    bool wakeClickUsed() const { return _wakeClickUsed; }
+    uint8_t totalClicksInCmd() const { return _totalClicksInCmd; }
 
 private:
     void notifySync(uint8_t temp) {
         if (_onSync) _onSync(temp, _cbCtx);
+    }
+
+    void abortAndSync(uint8_t realTemp) {
+        _hasPendingTarget = false;
+        _stalledClicks = 0;
+        _wakeClickUsed = false;
+        _totalClicksInCmd = 0;
+        uint8_t realClamped = clampTargetTemp(realTemp);
+        _targetTemp = realClamped;
+        _lastObservedTemp = realTemp;
+        notifySync(realClamped);
+        _state = State::IDLE;
     }
 
     ITriStateHardware& _hw;
@@ -324,14 +357,11 @@ private:
     uint8_t _targetTemp = 40;
     uint8_t _tempBeforeClick = 0;
     uint8_t _lastObservedTemp = 0;
-    uint8_t _estimatedTemp = 0;
-    uint32_t _tempPktBeforeClick = 0;
 
     bool _hasPendingTarget = false;
-    bool _wasFlameActive = false;
-    bool _reconcileAfterFlame = false;
+    bool _wakeClickUsed = false;
     uint8_t _stalledClicks = 0;
-    int8_t _blindClicksRemaining = 0;
+    uint8_t _totalClicksInCmd = 0;
 
     SetpointSyncCallback _onSync = nullptr;
     ClickCallback _onClick = nullptr;

@@ -133,9 +133,9 @@ public:
                         if (firstOne + 2 < afterSyncLen) return 46;
                     }
                 }
-                return frame63OrNull ? 47 : 46;
+                return -1;
             } else if (units == 7) {
-                return 47;
+                return -1;
             }
             return 40 + units;
         } else if (p0 == 0 && p1 == 0) {
@@ -168,6 +168,9 @@ public:
                     if (17 + zeroRun < afterSyncLen) return 39;
                 }
                 return 39;
+            }
+            if (units >= 4 && units <= 7) {
+                return 32 + units;
             }
         } else if (p0 == 1 && p1 == 0) {
             if (units == 0) return (frame63OrNull && frame63OrNull[62] == 0x31) ? 56 : 48;
@@ -285,6 +288,93 @@ public:
     }
 
     /**
+     * @brief Extrai o último sub-bloco (B3) separado por 0x00, ignorando 0x00 finais.
+     * Retorna o comprimento do sub-bloco B3 e preenche outStart com o ponteiro inicial.
+     */
+    static size_t extractLastSubBurst(const uint8_t* frame, size_t len, const uint8_t*& outStart) {
+        size_t end = len;
+        while (end > 0 && frame[end - 1] == 0x00) {
+            end--;
+        }
+        if (end == 0) {
+            outStart = frame;
+            return 0;
+        }
+        size_t start = end;
+        while (start > 0 && frame[start - 1] != 0x00) {
+            start--;
+        }
+        outStart = frame + start;
+        return end - start;
+    }
+
+    /**
+     * @brief Detecta chama acesa em quadros com sub-bloco B3 (71-73 bytes) ou blocos 0x77.
+     * No aquecedor real, B3 começa com 55 14 44 51 ... (padrão de bits 1011100 antes de 1000001).
+     */
+    static bool detectFlame(const uint8_t* frame, size_t len) {
+        if (countFlameBytes(frame, len) >= FLAME_THRESHOLD) {
+            return true;
+        }
+        const uint8_t* b3 = nullptr;
+        size_t b3Len = extractLastSubBurst(frame, len, b3);
+        if (b3Len >= 8 && b3Len < len) {
+            static const uint8_t flamePat[7] = {1, 0, 1, 1, 1, 0, 0};
+            static const uint8_t syncPat[7]  = {1, 0, 0, 0, 0, 0, 1};
+            uint8_t bits[40 * 5];
+            size_t bitsLen = demodulateUartToBits(b3, b3Len, bits, sizeof(bits));
+            int syncIdx = -1;
+            for (size_t i = 0; i + 7 <= bitsLen; i++) {
+                if (memcmp(&bits[i], syncPat, 7) == 0) {
+                    syncIdx = (int)i;
+                    break;
+                }
+            }
+            if (syncIdx >= 7) {
+                for (int i = 0; i + 7 <= syncIdx; i++) {
+                    if (memcmp(&bits[i], flamePat, 7) == 0) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * @brief Decodifica temperatura de um quadro completo de tamanho variável (63 a 80 bytes).
+     */
+    static int calculateTemperatureVariable(const uint8_t* frame, size_t len) {
+        if (len < FRAME_LEN || len > 90) return -1;
+
+        // 1. Se houver sub-bloco final B3 separado por 0x00, decodifica diretamente dele
+        const uint8_t* b3 = nullptr;
+        size_t b3Len = extractLastSubBurst(frame, len, b3);
+        if (b3Len >= 10 && b3Len < len && b3Len <= 40) {
+            static const uint8_t syncPat[7] = {1, 0, 0, 0, 0, 0, 1};
+            uint8_t bits[40 * 5];
+            size_t bitsLen = demodulateUartToBits(b3, b3Len, bits, sizeof(bits));
+            for (size_t i = 0; i + 12 <= bitsLen; i++) {
+                if (memcmp(&bits[i], syncPat, 7) == 0) {
+                    uint8_t p0 = bits[i + 7];
+                    uint8_t p1 = bits[i + 8];
+                    uint8_t units = (uint8_t)((bits[i + 9] << 2) | (bits[i + 10] << 1) | bits[i + 11]);
+                    const uint8_t* f63 = (len == FRAME_LEN) ? frame : nullptr;
+                    int t = decodeTempFromBitsAndFrame(p0, p1, units, &bits[i], bitsLen - i, f63);
+                    if (t >= 35 && t <= 60) return t;
+                    break;
+                }
+            }
+        }
+
+        // 2. Fallback para quadros clássicos de 63 bytes (sem separadores 0x00)
+        if (len == FRAME_LEN) {
+            return calculateTemperature(frame);
+        }
+        return -1;
+    }
+
+    /**
      * @brief Fallback tolerante a deslocamento de fase UART em uma rajada separada por silêncio.
      * Procura o padrão: '1000001' + p0 p1 u2 u1 u0 + '000' seguido de >= 12 zeros em sequência.
      */
@@ -386,6 +476,8 @@ class RinnaiUartDecoder {
 public:
     static constexpr size_t BUF_CAP = 256;
     static constexpr size_t BURST_CAP = 96;
+    static constexpr size_t MAX_FRAME_LEN = 80;
+    static constexpr uint8_t TEMP_DEBOUNCE_COUNT = 2;
     static constexpr uint32_t INTERFRAME_GAP_MS = 8;
     static constexpr uint32_t FLAME_HOLD_TIMEOUT_MS = 650;
 
@@ -493,38 +585,32 @@ public:
             }
 
             int nextPre = findPreambleFrom(4);
-            int tempStart = RinnaiFrameParser::findTempBlockStart(_buf, _bufLen);
             size_t consumeLen = RinnaiFrameParser::FRAME_LEN;
 
-            if (tempStart >= 46) {
-                size_t neededLen = (size_t)tempStart + 15;
-                if (nextPre >= 4 && (size_t)nextPre < neededLen) {
-                    if (nextPre >= (int)RinnaiFrameParser::FRAME_LEN) {
-                        processAlignedFrame(_buf, nowMs);
-                        consumeLen = (size_t)nextPre;
-                        updated = true;
-                    } else {
-                        consumeLen = (size_t)nextPre;
-                    }
-                } else {
-                    if (_bufLen < neededLen) {
-                        break;
-                    }
+            if (nextPre >= (int)RinnaiFrameParser::FRAME_LEN && nextPre <= (int)MAX_FRAME_LEN) {
+                // Quadro completo delimitado entre dois preâmbulos consecutivos (ex.: 71-73 bytes)
+                processVariableFrame(_buf, (size_t)nextPre, nowMs);
+                consumeLen = (size_t)nextPre;
+                updated = true;
+            } else if (nextPre >= 4 && nextPre < (int)RinnaiFrameParser::FRAME_LEN) {
+                consumeLen = (size_t)nextPre;
+            } else {
+                // Aguarda próximo preâmbulo se ainda cabe em MAX_FRAME_LEN (evita cortar quadro de 71-73B em 63B)
+                if (_bufLen < MAX_FRAME_LEN) {
+                    break;
+                }
+                int tempStart = RinnaiFrameParser::findTempBlockStart(_buf, _bufLen);
+                if (tempStart >= 46 && (size_t)tempStart + 15 <= _bufLen) {
                     uint8_t normFrame[RinnaiFrameParser::FRAME_LEN];
                     memcpy(normFrame, _buf, 48);
                     memcpy(normFrame + 48, _buf + tempStart, 15);
-                    processAlignedFrame(normFrame, nowMs);
-                    consumeLen = neededLen;
-                    updated = true;
-                }
-            } else {
-                if (nextPre >= 4 && nextPre < (int)RinnaiFrameParser::FRAME_LEN) {
-                    consumeLen = (size_t)nextPre;
+                    processVariableFrame(normFrame, RinnaiFrameParser::FRAME_LEN, nowMs);
+                    consumeLen = (size_t)tempStart + 15;
                 } else {
-                    processAlignedFrame(_buf, nowMs);
-                    consumeLen = (nextPre == (int)RinnaiFrameParser::FRAME_LEN) ? (size_t)nextPre : RinnaiFrameParser::FRAME_LEN;
-                    updated = true;
+                    processVariableFrame(_buf, RinnaiFrameParser::FRAME_LEN, nowMs);
+                    consumeLen = RinnaiFrameParser::FRAME_LEN;
                 }
+                updated = true;
             }
 
             memmove(_buf, _buf + consumeLen, _bufLen - consumeLen);
@@ -571,12 +657,12 @@ private:
 
         _state.lastBurstSize = (uint8_t)len;
 
-        // Se o alinhador por preâmbulo acabou de processar este ciclo, não duplica
-        if (_lastAlignedMs != 0 && (nowMs - _lastAlignedMs) < 120) {
+        // Se o alinhador por preâmbulo está ativo recentemente, não duplica nem fura o debounce
+        if (_lastAlignedMs != 0 && (nowMs - _lastAlignedMs) < 350) {
             return false;
         }
 
-        if (RinnaiFrameParser::countFlameBytes(_burst, len) >= RinnaiFrameParser::FLAME_THRESHOLD) {
+        if (RinnaiFrameParser::detectFlame(_burst, len)) {
             _state.flameActive = true;
             _state.powerOn = true;
             _state.valid = true;
@@ -584,6 +670,9 @@ private:
             _state.packetCount++;
             _lastFlameMs = nowMs;
             _lastFlamePacketMs = nowMs;
+            int temp = RinnaiFrameParser::calculateTemperatureVariable(_burst, len);
+            if (temp < 0) temp = RinnaiFrameParser::calculateTemperatureFromBurst(_burst, len);
+            updateDebouncedTemp(temp);
             return true;
         }
 
@@ -591,8 +680,7 @@ private:
         if (temp >= 35 && temp <= 60) {
             _state.flameActive = false;
             _state.powerOn = true;
-            _state.temperature = (uint8_t)temp;
-            _state.tempPacketCount++;
+            updateDebouncedTemp(temp);
             _state.packetCount++;
             _state.lastPacketMs = nowMs;
             _state.valid = true;
@@ -603,33 +691,60 @@ private:
         return false;
     }
 
-    void processAlignedFrame(const uint8_t frame[RinnaiFrameParser::FRAME_LEN], uint32_t nowMs) {
+    void updateDebouncedTemp(int temp) {
+        if (temp < 35 || temp > 60) return;
+        uint8_t t = (uint8_t)temp;
+        if (_state.temperature == 0) {
+            _state.temperature = t;
+            _state.tempPacketCount++;
+            _pendingTemp = 0;
+            _pendingTempCount = 0;
+            return;
+        }
+        if (t == _state.temperature) {
+            _pendingTemp = 0;
+            _pendingTempCount = 0;
+            _state.tempPacketCount++;
+            return;
+        }
+        if (t == _pendingTemp) {
+            _pendingTempCount++;
+        } else {
+            _pendingTemp = t;
+            _pendingTempCount = 1;
+        }
+        if (_pendingTempCount >= TEMP_DEBOUNCE_COUNT) {
+            _state.temperature = t;
+            _state.tempPacketCount++;
+            _pendingTemp = 0;
+            _pendingTempCount = 0;
+        }
+    }
+
+    void processVariableFrame(const uint8_t* frame, size_t len, uint32_t nowMs) {
         _lastAlignedMs = nowMs;
-        _burstLen = 0; // Quadro já processado pelo alinhador estrito
+        _burstLen = 0;
         _state.packetCount++;
         _state.lastPacketMs = nowMs;
         _state.valid = true;
-        memcpy(_state.rawTail, frame + (RinnaiFrameParser::FRAME_LEN - 12), 12);
+        size_t tailLen = (len >= 12) ? 12 : len;
+        memcpy(_state.rawTail, frame + (len - tailLen), tailLen);
 
-        size_t cnt77 = RinnaiFrameParser::countFlameBytes(frame, RinnaiFrameParser::FRAME_LEN);
-        if (cnt77 >= RinnaiFrameParser::FLAME_THRESHOLD) {
+        bool flame = RinnaiFrameParser::detectFlame(frame, len);
+        if (flame) {
             _state.flameActive = true;
             _state.powerOn = true;
             _lastFlameMs = nowMs;
             _lastFlamePacketMs = nowMs;
-            return;
+        } else {
+            _state.flameActive = false;
+            bool isOff = (len == RinnaiFrameParser::FRAME_LEN) && RinnaiFrameParser::checkPanelOff(frame);
+            _state.powerOn = !isOff;
         }
 
-        _state.flameActive = false;
-        bool isOff = RinnaiFrameParser::checkPanelOff(frame);
-        _state.powerOn = !isOff;
-
         if (_state.powerOn) {
-            int temp = RinnaiFrameParser::calculateTemperature(frame);
-            if (temp >= 35 && temp <= 60) {
-                _state.temperature = (uint8_t)temp;
-                _state.tempPacketCount++;
-            }
+            int temp = RinnaiFrameParser::calculateTemperatureVariable(frame, len);
+            updateDebouncedTemp(temp);
         }
     }
 
@@ -650,5 +765,7 @@ private:
 
     uint32_t _lastFlameMs = 0;
     uint32_t _lastFlamePacketMs = 0;
+    uint8_t _pendingTemp = 0;
+    uint8_t _pendingTempCount = 0;
     RinnaiTelemetryState _state;
 };

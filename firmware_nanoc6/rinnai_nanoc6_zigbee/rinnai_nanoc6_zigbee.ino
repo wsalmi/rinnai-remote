@@ -1049,11 +1049,6 @@ static uint32_t clickFlashUntilMs = 0;
 static RinnaiClickDir clickFlashDir = RinnaiClickDir::NONE;
 static uint32_t blueBlinkUntilMs = 0;
 
-static constexpr uint32_t UART_PIN_PROBE_TIMEOUT_MS = 2500;
-static uint8_t activeRxPin = RINNAI_TRISTATE_PIN;
-static uint32_t lastPinSwitchMs = 0;
-static uint32_t pktCountAtSwitch = 0;
-
 static void onControllerSetpointSync(uint8_t syncedTemp, void *ctx) {
     (void)ctx;
     Serial.printf("[CTRL] Sincronizando setpoint para %u°C no Zigbee\n", syncedTemp);
@@ -1090,26 +1085,11 @@ static void setRgbColor(uint8_t r, uint8_t g, uint8_t b) {
     }
 }
 
-static void startPassiveUartOnPin(uint8_t newPin, uint32_t nowMs, bool isSwitch) {
-    if (isSwitch) {
-        RinnaiSerial.end();
-        uint8_t prevPin = activeRxPin;
-        if (prevPin == RINNAI_TRISTATE_PIN) {
-            triStateHw.release();
-        } else {
-            pinMode(prevPin, INPUT);
-            gpio_set_pull_mode((gpio_num_t)prevPin, GPIO_FLOATING);
-        }
-    }
-
-    activeRxPin = newPin;
-    lastPinSwitchMs = nowMs;
-    pktCountAtSwitch = decoder.state().packetCount;
-
+static void startPassiveUartOnG1() {
     RinnaiSerial.setRxBufferSize(256);
-    RinnaiSerial.begin(2800, SERIAL_8N1, activeRxPin, -1);
-    gpio_pulldown_dis((gpio_num_t)activeRxPin);
-    gpio_pullup_en((gpio_num_t)activeRxPin);
+    RinnaiSerial.begin(2800, SERIAL_8N1, RINNAI_RX_PIN, -1);
+    gpio_pulldown_dis((gpio_num_t)RINNAI_RX_PIN);
+    gpio_pullup_en((gpio_num_t)RINNAI_RX_PIN);
     while (RinnaiSerial.available() > 0) {
         (void)RinnaiSerial.read();
     }
@@ -1167,9 +1147,9 @@ void setup() {
     triStateHw.begin();
     controller.setCallbacks(onControllerSetpointSync, onControllerClick, nullptr);
 
-    startPassiveUartOnPin(RINNAI_TRISTATE_PIN, millis(), false);
-    Serial.printf("[UART] Escuta passiva iniciada em G%u @ 2800 baud (8N1, pull-up ativo, auto-probe G2<->G1)\n",
-                  activeRxPin);
+    startPassiveUartOnG1();
+    Serial.printf("[UART] Escuta passiva iniciada em G%d @ 2800 baud (8N1, pull-up ativo)\n",
+                  RINNAI_RX_PIN);
 
     zbThermostat.setManufacturerAndModel("RinnaiCustom", "Rinnai-NanoC6");
     Zigbee.addEndpoint(&zbThermostat);
@@ -1215,16 +1195,6 @@ void loop() {
 
     const RinnaiTelemetryState &telemetry = decoder.state();
 
-    bool pinHasRecentPacket = telemetry.valid &&
-                                (telemetry.packetCount > pktCountAtSwitch) &&
-                                ((nowMs - telemetry.lastPacketMs) < UART_PIN_PROBE_TIMEOUT_MS);
-    if (!pinHasRecentPacket && (nowMs - lastPinSwitchMs) >= UART_PIN_PROBE_TIMEOUT_MS) {
-        uint8_t nextPin = (activeRxPin == RINNAI_TRISTATE_PIN) ? RINNAI_RX_PIN : RINNAI_TRISTATE_PIN;
-        Serial.printf("[UART] Sem pacotes validos em G%u apos %.1fs -> alternando para G%u\n",
-                      activeRxPin, UART_PIN_PROBE_TIMEOUT_MS / 1000.0f, nextPin);
-        startPassiveUartOnPin(nextPin, nowMs, true);
-    }
-
     int requestedSetpoint = 0;
     if (zbThermostat.consumePendingSetpoint(requestedSetpoint)) {
         Serial.printf("[ZIGBEE->CTRL] Novo alvo solicitado: %d°C\n", requestedSetpoint);
@@ -1237,9 +1207,7 @@ void loop() {
         zbThermostat.updateSystemMode(telemetry.powerOn, true);
     }
 
-    if (activeRxPin != RINNAI_TRISTATE_PIN) {
-        controller.update(telemetry, nowMs);
-    }
+    controller.update(telemetry, nowMs);
 
     static bool wasZbConnected = false;
     static uint32_t lastPeriodicReportMs = 0;
@@ -1301,9 +1269,9 @@ void loop() {
         char tailHexStr[40] = "--";
         formatHex(telemetry.lastRawBytes, telemetry.lastRawLen, rawHexStr, sizeof(rawHexStr));
         formatHex(telemetry.rawTail, telemetry.valid ? sizeof(telemetry.rawTail) : 0, tailHexStr, sizeof(tailHexStr));
-        Serial.printf("[STATUS] ZB=%s | RxPin=G%u | Online=%s | Power=%s | Chama=%s | Temp=%u°C | Alvo=%u°C | Pkts=%u | RxBytes=%u | Burst=%u | G1=%d | G2=%d | TailHEX=[%s] | LastHEX=[%s]\n",
+        Serial.printf("[STATUS] ZB=%s | RxPin=G%d | Online=%s | Power=%s | Chama=%s | Temp=%u°C | Alvo=%u°C | Pkts=%u | RxBytes=%u | Burst=%u | G1=%d | G2=%d | TailHEX=[%s] | LastHEX=[%s]\n",
                       zbConnected ? "OK" : "PAIRING",
-                      activeRxPin,
+                      RINNAI_RX_PIN,
                       telemetry.isOnline(nowMs) ? "YES" : "NO",
                       telemetry.powerOn ? "HEAT" : "OFF",
                       telemetry.flameActive ? "ATIVA" : "IDLE",

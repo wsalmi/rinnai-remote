@@ -1,5 +1,5 @@
 #include <Arduino.h>
-#include "rinnai_uart_decoder.h"
+#include "rinnai_rmt_decoder.h"
 #include "rinnai_tristate_buttons.h"
 #include "rinnai_zigbee_thermostat.h"
 
@@ -21,10 +21,18 @@
 #define RGB_DATA_PIN        20
 
 #define ZIGBEE_ENDPOINT_ID  1
+#define HEATING_HOLD_MS     1500
+
+// Estado exposto ao Zigbee: chama acesa = Aquecer (heat); qualquer outro caso = Desligado (off)
+static uint32_t lastFlameSeenMs = 0;
+static bool isHeating(const RinnaiTelemetryState &t, uint32_t nowMs) {
+    if (t.flameActive) lastFlameSeenMs = nowMs;
+    return lastFlameSeenMs != 0 && (nowMs - lastFlameSeenMs) < HEATING_HOLD_MS;
+}
 #define RESET_HOLD_MS       5000
 
-HardwareSerial RinnaiSerial(1);
-RinnaiUartDecoder decoder;
+Esp32RmtReceiver rmtRx;
+RinnaiRmtDecoder decoder;
 Esp32TriStateHardware triStateHw(RINNAI_TRISTATE_PIN);
 RinnaiClosedLoopController controller(triStateHw);
 RinnaiZigbeeThermostat zbThermostat(ZIGBEE_ENDPOINT_ID);
@@ -32,36 +40,6 @@ RinnaiZigbeeThermostat zbThermostat(ZIGBEE_ENDPOINT_ID);
 static uint32_t clickFlashUntilMs = 0;
 static RinnaiClickDir clickFlashDir = RinnaiClickDir::NONE;
 static uint32_t blueBlinkUntilMs = 0;
-
-static constexpr uint32_t UART_PIN_PROBE_TIMEOUT_MS = 2500;
-static uint8_t activeRxPin = RINNAI_TRISTATE_PIN; // Inicia em G2 (maior atividade detectada em bancada)
-static uint32_t lastPinSwitchMs = 0;
-static uint32_t pktCountAtSwitch = 0;
-
-static volatile uint32_t edgesG1 = 0;
-static volatile uint32_t lastEdgeUsG1 = 0;
-static volatile uint32_t lastPulseUsG1 = 0;
-static volatile uint32_t edgesG2 = 0;
-static volatile uint32_t lastEdgeUsG2 = 0;
-static volatile uint32_t lastPulseUsG2 = 0;
-
-void IRAM_ATTR onEdgeG1() {
-    uint32_t now = (uint32_t)micros();
-    if (lastEdgeUsG1 != 0) {
-        lastPulseUsG1 = now - lastEdgeUsG1;
-    }
-    lastEdgeUsG1 = now;
-    edgesG1++;
-}
-
-void IRAM_ATTR onEdgeG2() {
-    uint32_t now = (uint32_t)micros();
-    if (lastEdgeUsG2 != 0) {
-        lastPulseUsG2 = now - lastEdgeUsG2;
-    }
-    lastEdgeUsG2 = now;
-    edgesG2++;
-}
 
 static void setBlueLed(bool on) {
     static int8_t lastBlue = -1;
@@ -82,37 +60,6 @@ static void setRgbColor(uint8_t r, uint8_t g, uint8_t b) {
         lastB = b;
         rgbLedWrite(RGB_DATA_PIN, r, g, b);
     }
-}
-
-static void startPassiveUartOnPin(uint8_t newPin, uint32_t nowMs, bool isSwitch) {
-    if (isSwitch) {
-        RinnaiSerial.end();
-        uint8_t prevPin = activeRxPin;
-        if (prevPin == RINNAI_TRISTATE_PIN) {
-            triStateHw.release();
-        } else {
-            pinMode(prevPin, INPUT);
-            gpio_set_pull_mode((gpio_num_t)prevPin, GPIO_FLOATING);
-        }
-    }
-
-    activeRxPin = newPin;
-    lastPinSwitchMs = nowMs;
-    pktCountAtSwitch = decoder.state().packetCount;
-
-    RinnaiSerial.setRxBufferSize(256);
-    RinnaiSerial.begin(2800, SERIAL_8N1, activeRxPin, -1);
-    gpio_pulldown_dis((gpio_num_t)activeRxPin);
-    gpio_pullup_en((gpio_num_t)activeRxPin);
-    while (RinnaiSerial.available() > 0) {
-        (void)RinnaiSerial.read();
-    }
-
-    // Reanexa interrupções diagnósticas caso UART mux tenha reconfigurado o pino
-    detachInterrupt(digitalPinToInterrupt(RINNAI_RX_PIN));
-    detachInterrupt(digitalPinToInterrupt(RINNAI_TRISTATE_PIN));
-    attachInterrupt(digitalPinToInterrupt(RINNAI_RX_PIN), onEdgeG1, CHANGE);
-    attachInterrupt(digitalPinToInterrupt(RINNAI_TRISTATE_PIN), onEdgeG2, CHANGE);
 }
 
 static void onControllerSetpointSync(uint8_t syncedTemp, void *ctx) {
@@ -164,12 +111,10 @@ static void updateStatusLeds(uint32_t nowMs, bool zbConnected, bool btnPressed, 
     }
 
     // Conectado ao Zigbee: indica estado do aquecedor
-    if (telemetry.flameActive) {
-        setRgbColor(65, 22, 0); // Laranja = Chama ativa (banho)
-    } else if (telemetry.isOnline(nowMs) && telemetry.powerOn) {
-        setRgbColor(0, 20, 0);  // Verde suave = Ligado / Standby pronto
-    } else if (telemetry.isOnline(nowMs) && !telemetry.powerOn) {
-        setRgbColor(12, 12, 2); // Âmbar bem fraco = Painel em Off físico
+    if (isHeating(telemetry, nowMs)) {
+        setRgbColor(65, 22, 0); // Laranja = Chama ativa (Aquecer)
+    } else if (telemetry.isOnline(nowMs)) {
+        setRgbColor(0, 12, 0);  // Verde fraco = Desligado (sem chama), telemetria ok
     } else {
         setRgbColor(18, 12, 0); // Sem sinal recente da central
     }
@@ -212,10 +157,12 @@ void setup() {
     triStateHw.begin();
     controller.setCallbacks(onControllerSetpointSync, onControllerClick, nullptr);
 
-    // Inicia escuta passiva UART1 em G2 (alternando com G1 se não houver pacotes válidos em 2,5s)
-    startPassiveUartOnPin(RINNAI_TRISTATE_PIN, millis(), false);
-    Serial.printf("[UART] Escuta passiva iniciada em G%u @ 2800 baud (8N1, pull-up ativo, auto-probe G2<->G1)\n",
-                  activeRxPin);
+    // Inicia captura PWM hardware via RMT RX em G1 (1us/tick)
+    if (rmtRx.begin(RINNAI_RX_PIN)) {
+        Serial.println("[RMT] Captura PWM hardware iniciada em G1 (1us/tick, idle=3000us)");
+    } else {
+        Serial.println("[RMT] ERRO ao iniciar captura PWM em G1!");
+    }
     Serial.printf("[CTRL] Atuador Tri-State configurado em G%d (HY-M154)\n", RINNAI_TRISTATE_PIN);
 
     // Configurar Zigbee Thermostat Endpoint
@@ -248,17 +195,21 @@ void setup() {
         Serial.println("[ZIGBEE] Coordenador sem resposta no boot; stack segue reconectando em background (segure G9 por 5s para novo pareamento).");
     }
     zbThermostat.markStarted();
+    zbThermostat.requestOTAUpdate();
+    Serial.printf("[OTA] Firmware v0x%08X (Zigbee OTA cliente ativo)\n", (unsigned)RINNAI_FW_VERSION);
     Serial.println("[ZIGBEE] Stack iniciado. Aguardando pareamento / conexao...");
 }
 
 void loop() {
     uint32_t nowMs = millis();
 
-    // 1. Ler todos os bytes disponíveis da UART passiva (G2 ou G1)
+    // 1. Drenar todas as rajadas PWM recebidas via RMT RX (G1)
     bool telemetryUpdated = false;
-    while (RinnaiSerial.available() > 0) {
-        uint8_t b = (uint8_t)RinnaiSerial.read();
-        if (decoder.feedByte(b, nowMs)) {
+    static RinnaiRmtPulse pulseBuf[Esp32RmtReceiver::MAX_SYMBOLS * 2];
+    size_t pulseCount = 0;
+    uint32_t burstTsMs = 0;
+    while (rmtRx.popPulses(pulseBuf, sizeof(pulseBuf) / sizeof(pulseBuf[0]), pulseCount, burstTsMs)) {
+        if (decoder.feedPulses(pulseBuf, pulseCount, burstTsMs)) {
             telemetryUpdated = true;
             blueBlinkUntilMs = nowMs + 35;
         }
@@ -268,17 +219,6 @@ void loop() {
     }
 
     const RinnaiTelemetryState &telemetry = decoder.state();
-
-    // Auto-detecção G2 <-> G1: se não houver pacote válido recente em 2,5s no pino atual, alterna
-    bool pinHasRecentPacket = telemetry.valid &&
-                                (telemetry.packetCount > pktCountAtSwitch) &&
-                                ((nowMs - telemetry.lastPacketMs) < UART_PIN_PROBE_TIMEOUT_MS);
-    if (!pinHasRecentPacket && (nowMs - lastPinSwitchMs) >= UART_PIN_PROBE_TIMEOUT_MS) {
-        uint8_t nextPin = (activeRxPin == RINNAI_TRISTATE_PIN) ? RINNAI_RX_PIN : RINNAI_TRISTATE_PIN;
-        Serial.printf("[UART] Sem pacotes validos em G%u apos %.1fs -> alternando para G%u\n",
-                      activeRxPin, UART_PIN_PROBE_TIMEOUT_MS / 1000.0f, nextPin);
-        startPassiveUartOnPin(nextPin, nowMs, true);
-    }
 
     // 2. Processar comandos recebidos do Zigbee2MQTT / HomeKit
     int requestedSetpoint = 0;
@@ -290,47 +230,43 @@ void loop() {
 
     if (zbThermostat.consumePendingModeRevert()) {
         Serial.printf("[ZIGBEE] Revertendo system_mode para estado fisico (%s)\n",
-                      telemetry.powerOn ? "HEAT" : "OFF");
-        zbThermostat.updateSystemMode(telemetry.powerOn, true);
+                      isHeating(telemetry, nowMs) ? "HEAT" : "OFF");
+        zbThermostat.updateSystemMode(isHeating(telemetry, nowMs), true);
     }
 
-    // 3. Atualizar máquina de estados Tri-State (G2) somente quando G2 não estiver sendo escutado pela UART
-    if (activeRxPin != RINNAI_TRISTATE_PIN) {
-        controller.update(telemetry, nowMs);
-    }
+    // 3. Atualizar máquina de estados Tri-State (G2)
+    controller.update(telemetry, nowMs);
 
     // 4. Reportar telemetria ao Zigbee quando conectar ou houver mudança
     static bool wasZbConnected = false;
+    static bool initialStateSynced = false;
     static uint32_t lastPeriodicReportMs = 0;
     bool zbConnected = Zigbee.connected();
     bool justConnected = (zbConnected && !wasZbConnected);
+    bool heating = isHeating(telemetry, nowMs);
+    static bool lastHeating = false;
+    if (heating != lastHeating) { lastHeating = heating; telemetryUpdated = true; }
     wasZbConnected = zbConnected;
 
     if (justConnected) {
         Serial.println("[ZIGBEE] Conectado a rede Zigbee! Enviando estado inicial...");
         zbThermostat.applySetpointLimits();
         lastPeriodicReportMs = nowMs;
-        if (telemetry.valid) {
-            zbThermostat.updateSystemMode(telemetry.powerOn, true);
-            zbThermostat.updateRunningState(telemetry.flameActive, true);
-            if (telemetry.temperature > 0) {
-                zbThermostat.updateLocalTemperature(telemetry.temperature, true);
-                zbThermostat.updateHeatingSetpoint(
-                    RinnaiClosedLoopController::clampTargetTemp(telemetry.temperature), true
-                );
-            }
-        }
-    } else if (zbConnected && telemetry.valid) {
-        bool periodicSync = (nowMs - lastPeriodicReportMs) >= 60000;
+        initialStateSynced = false;
+    }
+
+    if (zbConnected && telemetry.valid) {
+        bool periodicSync = !initialStateSynced || (nowMs - lastPeriodicReportMs) >= 60000;
         if (telemetryUpdated || periodicSync) {
-            zbThermostat.updateSystemMode(telemetry.powerOn, periodicSync);
-            zbThermostat.updateRunningState(telemetry.flameActive, periodicSync);
+            zbThermostat.updateSystemMode(heating, periodicSync);
+            zbThermostat.updateRunningState(heating, periodicSync);
             if (telemetry.temperature > 0) {
                 zbThermostat.updateLocalTemperature(telemetry.temperature, periodicSync);
             }
             if (periodicSync) {
                 zbThermostat.updateHeatingSetpoint(controller.targetTemp(), true);
                 lastPeriodicReportMs = nowMs;
+                initialStateSynced = true;
             }
         }
     }
@@ -352,36 +288,50 @@ void loop() {
                 pos += snprintf(out + pos, outCap - pos, "%s%02X", i == 0 ? "" : " ", buf[i]);
             }
         };
-        char rawHexStr[52] = "--";
-        char tailHexStr[40] = "--";
-        formatHex(telemetry.lastRawBytes, telemetry.lastRawLen, rawHexStr, sizeof(rawHexStr));
-        formatHex(telemetry.rawTail, telemetry.valid ? sizeof(telemetry.rawTail) : 0, tailHexStr, sizeof(tailHexStr));
-        Serial.printf("[STATUS] ZB=%s | RxPin=G%u | Online=%s | Power=%s | Chama=%s | Temp=%u°C | Alvo=%u°C | Pkts=%u | RxBytes=%u | Burst=%u | G1=%d(E=%u,%uus) | G2=%d(E=%u,%uus) | TailHEX=[%s] | LastHEX=[%s]\n",
+        char b3HexStr[32] = "--";
+        if (telemetry.valid) {
+            formatHex(telemetry.rawTail, 8, b3HexStr, sizeof(b3HexStr));
+        }
+        Serial.printf("[STATUS] ZB=%s | Rx=RMT(G%d) | Online=%s | Modo=%s | Chama=%s | Temp=%u°C | Alvo=%u°C | Pkts=%u | CRC=%u/%u | Bursts=%u | Drops=%u | G1=%d | G2=%d | B3=[%s]\n",
                       zbConnected ? "OK" : "PAIRING",
-                      activeRxPin,
+                      RINNAI_RX_PIN,
                       telemetry.isOnline(nowMs) ? "YES" : "NO",
-                      telemetry.powerOn ? "HEAT" : "OFF",
+                      heating ? "HEAT" : "OFF",
                       telemetry.flameActive ? "ATIVA" : "IDLE",
                       telemetry.temperature,
                       controller.targetTemp(),
                       telemetry.packetCount,
-                      telemetry.rxByteCount,
-                      telemetry.lastBurstSize,
+                      (unsigned)decoder.crcOkCount(),
+                      (unsigned)decoder.crcErrCount(),
+                      (unsigned)decoder.totalBursts(),
+                      (unsigned)rmtRx.dropCount(),
                       gpio_get_level((gpio_num_t)RINNAI_RX_PIN),
-                      (unsigned)edgesG1,
-                      (unsigned)lastPulseUsG1,
                       gpio_get_level((gpio_num_t)RINNAI_TRISTATE_PIN),
-                      (unsigned)edgesG2,
-                      (unsigned)lastPulseUsG2,
-                      tailHexStr,
-                      rawHexStr);
+                      b3HexStr);
 
-        char fullFrameHex[256] = "--";
-        formatHex(telemetry.lastFullFrame, telemetry.lastFullFrameLen, fullFrameHex, sizeof(fullFrameHex));
-        Serial.printf("[FRAME] len=%u HEX=[%s]\n",
-                      telemetry.lastFullFrameLen,
-                      fullFrameHex);
+        for (size_t bi = 0; bi < RinnaiRmtDecoder::RECENT_BURST_SLOTS; bi++) {
+            const RinnaiRmtBurstSummary &rb = decoder.recentBurst(bi);
+            if (rb.pulseCount == 0) continue;
+            char pkt8Str[32] = "--";
+            if (rb.pkt8Valid) {
+                formatHex(rb.pkt8, 8, pkt8Str, sizeof(pkt8Str));
+            }
+            Serial.printf("[RMT-B%u] n=%u H=%u..%uus(%u) L=%u..%uus(%u) lbits=%u hbits=%u inv=%d crc=%s pkt8=[%s]\n",
+                          (unsigned)bi,
+                          (unsigned)rb.pulseCount,
+                          (unsigned)rb.minHighUs,
+                          (unsigned)rb.maxHighUs,
+                          (unsigned)rb.highCount,
+                          (unsigned)rb.minLowUs,
+                          (unsigned)rb.maxLowUs,
+                          (unsigned)rb.lowCount,
+                          (unsigned)rb.lowBitCount,
+                          (unsigned)rb.highBitCount,
+                          rb.inverted ? 1 : 0,
+                          rb.crcOk ? "OK" : "ERR",
+                          pkt8Str);
+        }
     }
 
-    delay(5);
+    delay(2);
 }

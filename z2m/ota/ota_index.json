@@ -1,0 +1,56 @@
+[
+  {
+    "fileName": "rinnai_nanoc6_00010001.ota",
+    "fileVersion": 65537,
+    "fileSize": 673294,
+    "manufacturerCode": 4097,
+    "imageType": 4113,
+    "sha512": "929aac23e77dbc11e94d51bdc064752e74e6146356f216d0785e89dc25eeea906a35c992e9e809a82864b518b23d97ccbb3fefa9a956a29de47c481a73aa6a7b",
+    "url": "rinnai_nanoc6_00010001.ota"
+  },
+  {
+    "fileName": "rinnai_nanoc6_00010002.ota",
+    "fileVersion": 65538,
+    "fileSize": 673630,
+    "manufacturerCode": 4097,
+    "imageType": 4113,
+    "sha512": "73949eaf8d7863504075e13df77c92014f869265bb9b2d4fd5129def9621e7e077ca6c4e7ed27e4346869003acaa1b13fb74918d11c34247132aab041ae593a6",
+    "url": "rinnai_nanoc6_00010002.ota"
+  },
+  {
+    "fileName": "rinnai_nanoc6_00010003.ota",
+    "fileVersion": 65539,
+    "fileSize": 673646,
+    "manufacturerCode": 4097,
+    "imageType": 4113,
+    "sha512": "72116558ff39385bceae84bf3550acf6f87ded6601df91daa4949a3c46d69998b017116bc7533faf88fc4b4cf0c379654a43588dab7199f2f3e45f3bb71ed84b",
+    "url": "rinnai_nanoc6_00010003.ota"
+  },
+  {
+    "fileName": "rinnai_nanoc6_00010005.ota",
+    "fileVersion": 65541,
+    "fileSize": 654590,
+    "manufacturerCode": 4097,
+    "imageType": 4113,
+    "sha512": "bf455ef77461486d2673afdc7d7c91c482d2760da23f9a2cdb1088d4fff59b60b53f591f897341915fd67b8964abd2b283647ede57e4d9a605a2444854574e2a",
+    "url": "rinnai_nanoc6_00010005.ota"
+  },
+  {
+    "fileName": "rinnai_nanoc6_00010006.ota",
+    "fileVersion": 65542,
+    "fileSize": 655038,
+    "manufacturerCode": 4097,
+    "imageType": 4113,
+    "sha512": "b4b98d36ebb3cd1bca5a4e61568e8a0e5b86b6df6a150aca320cf6dcac40034d7cfce037b8895caa7263d93dc2c2c66d2f65ce5f664c3b40ca15cf91e81a4f24",
+    "url": "rinnai_nanoc6_00010006.ota"
+  },
+  {
+    "fileName": "rinnai_nanoc6_00010007.ota",
+    "fileVersion": 65543,
+    "fileSize": 655838,
+    "manufacturerCode": 4097,
+    "imageType": 4113,
+    "sha512": "f2b7df5e2f008709c6e1493103459c0df516796cf8592323a5c2347acb69ec2895f6f5f48e261f1859df9823f071467d73e0d253eedfb9cd1b3d45707f4b033e",
+    "url": "rinnai_nanoc6_00010007.ota"
+  }
+]

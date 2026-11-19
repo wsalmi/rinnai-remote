@@ -59,13 +59,15 @@ rinnai-remote/
 ├── firmware_nanoc6/               # Firmware Zigbee End Device para M5Stack M5NanoC6
 │   ├── platformio.ini             # Ambiente ESP32-C6 (pioarduino) com Zigbee ED
 │   ├── include/
-│   │   ├── rinnai_uart_decoder.h      # Receptor UART 2800 baud + detector de chama 0x77
-│   │   ├── rinnai_tristate_buttons.h  # Controle Tri-State (G2) + trava anti-loop
-│   │   └── rinnai_zigbee_thermostat.h # Endpoint ZCL Thermostat (Cluster 0x0201)
+│   │   ├── rinnai_rmt_decoder.h       # Receptor PWM hardware via RMT RX (1 µs) + CRC-16 (0xE815)
+│   │   ├── rinnai_uart_decoder.h      # Tipos base de telemetria e parser legado
+│   │   ├── rinnai_tristate_buttons.h  # Controle Tri-State (G2) + trava anti-loop (35°C–43°C)
+│   │   └── rinnai_zigbee_thermostat.h # Endpoint ZCL Thermostat (Cluster 0x0201) + cliente OTA
 │   ├── src/main.cpp
 │   └── rinnai_nanoc6_zigbee/      # Sketch standalone para Arduino IDE 2.x
 └── z2m/
-    └── rinnai_nanoc6.js           # External converter para Zigbee2MQTT (35°C–48°C)
+    ├── rinnai_nanoc6.mjs          # External converter ESM para Zigbee2MQTT 2.x (35°C–43°C + OTA)
+    └── ota/                       # Imagens .ota e ota_index.json gerados por tools/make_ota.py
 ```
 
 ---
@@ -406,12 +408,13 @@ pio device monitor -b 115200
 > A injeção direta de pacotes no fio `RX` da central pode causar colisão elétrica (*bus contention*) com o painel frontal original, fazendo o painel entrar em estado de erro. Para uso definitivo em produção com **M5Stack M5NanoC6**, **Zigbee2MQTT** e **Homebridge (HomeKit)**, recomenda-se a abordagem **100% passiva na linha TX + acionamento optoisolado nos botões físicos (`+` e `-`)**.
 
 ### Arquitetura da Solução
-1. **Leitura Passiva (`G1`):** O M5NanoC6 escuta o fio `TX` da central em `2800 baud` via divisor resistivo ($10\,\text{k}\Omega / 20\,\text{k}\Omega$), mantendo alta impedância sem interferir no barramento.
+1. **Leitura Passiva (`G1`):** O M5NanoC6 escuta o fio `TX` da central via divisor resistivo ($10\,\text{k}\Omega / 20\,\text{k}\Omega$) utilizando o periférico **RMT RX** em hardware (resolução de $1\,\mu\text{s}$) para decodificar diretamente os pulsos PWM de 64 bits com validação **CRC-16 (`0xE815`)**, mantendo alta impedância sem interferir no barramento.
 2. **Atuação Tri-State (`G2` + HY-M154):** Usando apenas o pino `G2` do conector Grove em três estados (`INPUT Hi-Z`, `OUTPUT HIGH` e `OUTPUT LOW`) ligado a dois canais do módulo optoacoplador **HY-M154 (PC817)**, o firmware aciona os botões físicos `+` e `-` com isolamento galvânico total.
-3. **Malha Fechada + Trava Anti-Loop:** Ajustes solicitados pelo HomeKit são limitados à faixa segura de banho (**35°C a 48°C**, passo `1°C`) e verificados quadro a quadro. Se após 2 cliques a temperatura real não mudar (ex: trava de segurança $>42^\circ\text{C}$ durante o banho), os cliques são interrompidos e o setpoint é sincronizado com o painel.
-4. **Zigbee2MQTT & HomeKit (`homebridge-z2m`):** Exposto como Termostato Zigbee (`Rinnai-NanoC6`) com indicador de chama ativa (`running_state: heat` $\rightarrow$ status *Aquecendo* no app Casa) e `system_mode` espelhando o estado físico do botão Power.
+3. **Malha Fechada + Trava Anti-Loop:** Ajustes solicitados pelo HomeKit são limitados à faixa segura de banho (**35°C a 43°C**, passo `1°C`) e verificados quadro a quadro. Se após 2 cliques a temperatura real não mudar (ex: trava de segurança $>42^\circ\text{C}$ durante o banho), os cliques são interrompidos e o setpoint é sincronizado com o painel.
+4. **Zigbee2MQTT & HomeKit (`homebridge-z2m`):** Exposto como Termostato Zigbee (`Rinnai-NanoC6`) com `system_mode` e `running_state` seguindo a chama (`heat` quando a chama está acesa, `off`/`idle` em qualquer outro caso) e cliente OTA Zigbee (`cluster 0x0019`).
 
-Consulte o guia passo a passo completo (esquema elétrico nos bornes do HY-M154, isolamento, gravação e configuração do Z2M):
+Consulte o guia passo a passo completo (esquema elétrico nos bornes do HY-M154, isolamento, gravação, OTA e configuração do Z2M):
 * [docs/nanoc6_hym154_wiring.md](file:///Users/wesleysalmi/source-me/rinnai-remote/docs/nanoc6_hym154_wiring.md)
+* [docs/ota.md](file:///Users/wesleysalmi/source-me/rinnai-remote/docs/ota.md)
 * [firmware_nanoc6/platformio.ini](file:///Users/wesleysalmi/source-me/rinnai-remote/firmware_nanoc6/platformio.ini) | [rinnai_nanoc6_zigbee.ino](file:///Users/wesleysalmi/source-me/rinnai-remote/firmware_nanoc6/rinnai_nanoc6_zigbee/rinnai_nanoc6_zigbee.ino)
-* [z2m/rinnai_nanoc6.js](file:///Users/wesleysalmi/source-me/rinnai-remote/z2m/rinnai_nanoc6.js)
+* [z2m/rinnai_nanoc6.mjs](file:///Users/wesleysalmi/source-me/rinnai-remote/z2m/rinnai_nanoc6.mjs)
