@@ -32,7 +32,7 @@ O projeto inclui documentação técnica aprofundada, ferramentas de análise em
    - [Transmissão e Injeção de Comandos no TX](#transmissão-e-injeção-de-comandos-no-tx)
 8. [Uso das Ferramentas Python](#8-uso-das-ferramentas-python)
 9. [Compilação e Gravação do Firmware ESP32](#9-compilação-e-gravação-do-firmware-esp32)
-10. [Integração Zigbee2MQTT & HomeKit (M5NanoC6 + HY-M154 Tri-State)](#10-integração-zigbee2mqtt--homekit-m5nanoc6--hy-m154-tri-state)
+10. [Integração Zigbee2MQTT & HomeKit (M5NanoC6 + Optoacopladores PC817 Tri-State)](#10-integração-zigbee2mqtt--homekit-m5nanoc6--optoacopladores-pc817-tri-state)
 
 ---
 
@@ -45,7 +45,8 @@ rinnai-remote/
 │   ├── physical_layer.md          # Níveis elétricos, divisores de tensão e osciladores
 │   ├── protocol_spec.md           # Detalhes de quadros, paridade e comandos do painel
 │   ├── captures_and_analysis.md   # Logs reais brutos (Standby vs Chuveiro a 42°C)
-│   └── nanoc6_hym154_wiring.md    # Esquema M5NanoC6 + HY-M154 Tri-State + Z2M/HomeKit
+│   ├── nanoc6_hym154_wiring.md    # Esquema M5NanoC6 + PC817 Tri-State (2 placas) + Z2M/HomeKit
+│   └── ota.md                     # Atualização OTA via Zigbee2MQTT (cluster 0x0019)
 ├── tools/                         # Utilitários de captura e decodificação
 │   ├── bp_capture.py              # Sniffer em tempo real via WebSocket do Bus Pirate
 │   └── decoder.py                 # Biblioteca Python de validação, paridade e desempacotamento
@@ -402,19 +403,93 @@ pio device monitor -b 115200
 
 ---
 
-## 10. Integração Zigbee2MQTT & HomeKit (M5NanoC6 + HY-M154 Tri-State)
+## 10. Integração Zigbee2MQTT & HomeKit (M5NanoC6 + Optoacopladores PC817 Tri-State)
 
 > [!NOTE]
 > A injeção direta de pacotes no fio `RX` da central pode causar colisão elétrica (*bus contention*) com o painel frontal original, fazendo o painel entrar em estado de erro. Para uso definitivo em produção com **M5Stack M5NanoC6**, **Zigbee2MQTT** e **Homebridge (HomeKit)**, recomenda-se a abordagem **100% passiva na linha TX + acionamento optoisolado nos botões físicos (`+` e `-`)**.
 
 ### Arquitetura da Solução
 1. **Leitura Passiva (`G1`):** O M5NanoC6 escuta o fio `TX` da central via divisor resistivo ($10\,\text{k}\Omega / 20\,\text{k}\Omega$) utilizando o periférico **RMT RX** em hardware (resolução de $1\,\mu\text{s}$) para decodificar diretamente os pulsos PWM de 64 bits com validação **CRC-16 (`0xE815`)**, mantendo alta impedância sem interferir no barramento.
-2. **Atuação Tri-State (`G2` + HY-M154):** Usando apenas o pino `G2` do conector Grove em três estados (`INPUT Hi-Z`, `OUTPUT HIGH` e `OUTPUT LOW`) ligado a dois canais do módulo optoacoplador **HY-M154 (PC817)**, o firmware aciona os botões físicos `+` e `-` com isolamento galvânico total.
+2. **Atuação Tri-State (`G2` + 2 Placas PC817):** Usando apenas o pino `G2` do conector Grove em três estados (`INPUT Hi-Z`, `OUTPUT HIGH` e `OUTPUT LOW`) ligado a duas placas optoacopladoras separadas — **1 canal da placa `HY-M154` (4 canais)** para o botão **`+`** e **1 canal do módulo isolador `PC817` de 2 canais (`3,6V–30V`)** para o botão **`−`** —, o firmware aciona os botões físicos com isolamento galvânico total.
 3. **Malha Fechada + Trava Anti-Loop:** Ajustes solicitados pelo HomeKit são limitados à faixa segura de banho (**35°C a 43°C**, passo `1°C`) e verificados quadro a quadro. Se após 2 cliques a temperatura real não mudar (ex: trava de segurança $>42^\circ\text{C}$ durante o banho), os cliques são interrompidos e o setpoint é sincronizado com o painel.
 4. **Zigbee2MQTT & HomeKit (`homebridge-z2m`):** Exposto como Termostato Zigbee (`Rinnai-NanoC6`) com `system_mode` e `running_state` seguindo a chama (`heat` quando a chama está acesa, `off`/`idle` em qualquer outro caso) e cliente OTA Zigbee (`cluster 0x0019`).
 
-Consulte o guia passo a passo completo (esquema elétrico nos bornes do HY-M154, isolamento, gravação, OTA e configuração do Z2M):
-* [docs/nanoc6_hym154_wiring.md](file:///Users/wesleysalmi/source-me/rinnai-remote/docs/nanoc6_hym154_wiring.md)
-* [docs/ota.md](file:///Users/wesleysalmi/source-me/rinnai-remote/docs/ota.md)
-* [firmware_nanoc6/platformio.ini](file:///Users/wesleysalmi/source-me/rinnai-remote/firmware_nanoc6/platformio.ini) | [rinnai_nanoc6_zigbee.ino](file:///Users/wesleysalmi/source-me/rinnai-remote/firmware_nanoc6/rinnai_nanoc6_zigbee/rinnai_nanoc6_zigbee.ino)
-* [z2m/rinnai_nanoc6.mjs](file:///Users/wesleysalmi/source-me/rinnai-remote/z2m/rinnai_nanoc6.mjs)
+### Modelo de Fiação Utilizado em Produção
+
+#### 1. Pinagem do Conector Grove (`HY2.0-4P`) do M5NanoC6
+
+| Fio Grove | Pino M5NanoC6 | Ligação no Sistema Rinnai |
+| :---: | :---: | :--- |
+| **Preto** | `GND` | **Fio 2 (`GND`)** do chicote da central (terra comum com entrada do canal `+` e saída dos optoacopladores) |
+| **Vermelho** | `5V` | **Fio 1 (`+5V`)** do chicote da central (alimentação do M5NanoC6 e referência `+5V` do canal `−`) |
+| **Branco** | **`G1` (`GPIO 1`)** | **Leitura passiva (`RMT RX`, $1\,\mu\text{s}$)** ligada ao **Fio 3 (`TX Central`)** via divisor resistivo **$10\,\text{k}\Omega / 20\,\text{k}\Omega$** ($5\,\text{V} \rightarrow 3.33\,\text{V}$) |
+| **Amarelo** | **`G2` (`GPIO 2`)** | **Saída Tri-State** emendada em "Y" para acionar as duas placas optoacopladoras (`+` e `−`) |
+| *Não usado* | — | **Fio 4 (`RX Central / TX Painel`)** **não é conectado** ao M5NanoC6 (permanece ligado apenas entre central e painel original) |
+
+#### 2. Por que duas placas optoacopladoras separadas (`HY-M154` + Módulo PC817 de 2 Canais)?
+
+Na lógica Tri-State com um único pino (`G2`), o canal do botão **`+`** exige **`CH1− = GND`**, enquanto o canal do botão **`−`** exige **`IN1− = G2`**. Tanto a placa verde **`HY-M154` (4 canais)** quanto muitos lotes do módulo isolador **`PC817` de 2 canais (`3,6V–30V`)** interligam internamente o negativo dos canais na mesma PCB (continuidade entre o `Parafuso 2` e o `Parafuso 4` de entrada). Ligar os dois canais em uma mesma placa com negativos comuns colocaria `G2` em curto direto com `GND`.
+
+Ao usar **1 canal de cada placa fisicamente separada**, os negativos de entrada ficam totalmente independentes **sem precisar cortar trilhas na placa nem levantar pinos dos CIs `PC817`**.
+
+#### 3. Ligação dos Bornes (Entrada e Saída)
+
+| Placa / Função | Entrada (Esquerda) | Jumper da Saída | Modificação na Saída | Saída para o Painel (Direita — 3 fios) |
+| :--- | :--- | :--- | :--- | :--- |
+| **Placa 1: `HY-M154`**<br>(Canal 1 $\rightarrow$ Botão **`+`**) | `Parafuso 1 (CH1+)` $\leftarrow$ **`G2` (Amarelo)**<br>`Parafuso 2 (CH1−)` $\leftarrow$ **`GND` (Preto)** | `J1`: pode ficar **mantido** (`Parafuso 2` já é `GND`) ou removido com fio direto ao `GND` | **Bypass** com pingo de solda sobre o resistor SMD **`302`** ($3\,\text{k}\Omega$) da saída ($0\,\Omega$) | `Borne CH1+` (Coletor / Pino 4) $\rightarrow$ lado em Alta (`+5V` Pull-Up) do **Botão `+`**<br>`Borne CH1−` (Emissor / Pino 3) $\rightarrow$ **`GND` compartilhado** |
+| **Placa 2: `PC817` 2 Canais** (`3,6V–30V`)<br>(Canal 1 $\rightarrow$ Botão **`−`**) | `Parafuso 1 (IN1+)` $\leftarrow$ **`+5V` (Vermelho)**<br>`Parafuso 2 (IN1−)` $\leftarrow$ **`G2` (Amarelo, emenda em "Y")** | `J1`: **REMOVIDO OBRIGATORIAMENTE** (`IN1−` é `G2`, nunca `GND`) | **Bypass** com pingo de solda sobre o resistor SMD **`302`** ($3\,\text{k}\Omega$) da saída ($0\,\Omega$) | `Borne OUT1+` (Coletor / Pino 4) $\rightarrow$ lado em Alta (`+5V` Pull-Up) do **Botão `−`**<br>`Borne OUT1−` (Emissor / Pino 3) $\rightarrow$ ponte ao **`GND` compartilhado** |
+
+> [!TIP]
+> Os botões `+` e `−` do painel frontal operam em lógica **Active-LOW (Pull-Up)** compartilhando o mesmo **`GND`**. Com os dois emissores (`Pino 3` / `Borne −`) interligados ao `GND` comum e o bypass nos resistores `302` ($3\,\text{k}\Omega$) de saída para garantir um `GND` franco ($\approx 0\,\Omega$), apenas **3 fios** seguem até o painel frontal: **`BTN+`**, **`BTN−`** e **`GND` compartilhado**.
+
+#### 4. Lógica Tri-State no Pino `G2`
+
+Cada entrada `PC817` possui em série um resistor limitador (`302`), um LED indicador SMD ($V_F \approx 1.8\,\text{V}$) e o LED infravermelho interno do `PC817` ($V_F \approx 1.2\,\text{V}$), resultando em um limiar de condução de **$V_{\text{limiar}} \approx 3.0\,\text{V}$ por canal**:
+
+| Estado de `G2` (`GPIO 2`) | Tensão no Canal `+` (`G2 → GND`) | Tensão no Canal `−` (`5V → G2`) | Ação nos Botões do Painel |
+| :--- | :--- | :--- | :--- |
+| **`INPUT` (Hi-Z / flutuante)** | Os 2 canais em série entre `5V` e `GND` ($\approx 6.0\,\text{V}$ necessários $> 5.0\,\text{V}$) | $0\,\text{mA}$ nos dois LEDs | **Botão `+` SOLTO \| Botão `−` SOLTO** |
+| **`OUTPUT HIGH` ($3.3\,\text{V}$)** | $3.3\,\text{V} - 0\,\text{V} = 3.3\,\text{V} \ge 3.0\,\text{V}$ (**conduz**) | $5.0\,\text{V} - 3.3\,\text{V} = 1.7\,\text{V} < 3.0\,\text{V}$ (corte) | **Fecha Botão `+` (`TEMP +`)** |
+| **`OUTPUT LOW` ($0\,\text{V}$)** | $0\,\text{V} - 0\,\text{V} = 0\,\text{V}$ (corte) | $5.0\,\text{V} - 0\,\text{V} = 5.0\,\text{V} \ge 3.0\,\text{V}$ (**conduz**) | **Fecha Botão `−` (`TEMP −`)** |
+
+#### 5. Diagrama Esquemático Completo
+
+```text
+  CHICOTE RINNAI                     M5NanoC6 (Grove HY2.0-4P)
+  ──────────────                     ─────────────────────────
+  Fio 1 (+5V) ──────────────────┬──> [ 5V  ] (Vermelho)
+                                │
+  Fio 2 (GND) ──────────────┬───┼──> [ GND ] (Preto)
+                            │   │
+  Fio 3 (TX) ──[ 10 kΩ ]──┬─┼───┼──> [ G1  ] (Branco - RMT RX 1 µs)
+                          │ │   │
+                       [20 kΩ]  │    Fio 4 (RX Central) ── (Não ligado ao M5NanoC6)
+                          │ │   │
+                         GND│   │
+                            │   │    PLACA 1: HY-M154 (Canal 1 = Botão "+")
+                            │   │    ┌────────────────────────────────────────────────────┐
+             ┌──────────────┼───┼───>│ Paraf. 1 (CH1+) ──> PC817 #1 ──[302]──[LED]──┐     │
+             │              └───┼───>│ Paraf. 2 (CH1−) <────────────────────────────┘(GND)│
+             │                  │    ├────────────────────────────────────────────────────┤
+             │                  │    │ Saída (J1 opcional | SMD 302 com BYPASS 0 Ω):      │
+             │                  │    │  • Borne CH1+  (Pino 4 Coletor) ───────────────────┤──> BTN+ (+5V Pull-Up)
+             │                  │    │  • Borne CH1−  (Pino 3 Emissor) ───────────────────┤──┐
+             │                  │    └────────────────────────────────────────────────────┘  │
+  [ G2 ] ────┤ (Emenda "Y")     │                                                            │ (ponte GND
+  (Amarelo)  │                  │    PLACA 2: Módulo PC817 2 Canais (Canal 1 = Botão "−")    │  comum)
+             │                  │    ┌────────────────────────────────────────────────────┐  │
+             │                  └───>│ Paraf. 1 (IN1+) ──> PC817 #2 ──[302]──[LED]──┐(+5V)│  │
+             └──────────────────────>│ Paraf. 2 (IN1−) <────────────────────────────┘     │  │
+                                     ├────────────────────────────────────────────────────┤  │
+                                     │ Saída (J1 REMOVIDO | SMD 302 com BYPASS 0 Ω):      │  │
+                                     │  • Borne OUT1+ (Pino 4 Coletor) ───────────────────┤──┼──> BTN− (+5V Pull-Up)
+                                     │  • Borne OUT1− (Pino 3 Emissor) ───────────────────┤──┴──> GND Painel
+                                     └────────────────────────────────────────────────────┘
+                                       ▲ Total até o painel frontal: 3 fios (BTN+, BTN−, GND)
+```
+
+Consulte a documentação complementar para detalhes de montagem, calibração, OTA e configuração do Z2M:
+* [docs/nanoc6_hym154_wiring.md](docs/nanoc6_hym154_wiring.md)
+* [docs/ota.md](docs/ota.md)
+* [firmware_nanoc6/platformio.ini](firmware_nanoc6/platformio.ini) | [rinnai_nanoc6_zigbee.ino](firmware_nanoc6/rinnai_nanoc6_zigbee/rinnai_nanoc6_zigbee.ino)
+* [z2m/rinnai_nanoc6.mjs](z2m/rinnai_nanoc6.mjs)
